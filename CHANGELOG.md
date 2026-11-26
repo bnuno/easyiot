@@ -1,0 +1,1726 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+## [9.236] - 2026-11-24
+
+### Fixed
+
+- The LED strip reported itself to CloudIO as "led" on every device. The
+  cloud looks features up by id across all devices, so a second strip
+  anywhere would have taken over the first one's cloud feature. Its cloud
+  id is now "<chipId>led", like every other feature, and its cloud command
+  and status topics follow. The panel, local MQTT and Home Assistant keep
+  "led". CloudIO renames the existing feature on the first sync, so its
+  name, favourite and order are kept.
+
+### Para testers
+
+- **Fita LED na Alexa**: depois de atualizar, a fita aparece na Alexa como
+  um dispositivo novo. Diz «Alexa, descobre dispositivos» e apaga a entrada
+  antiga, que deixa de responder.
+
+## [9.235] - 2026-11-24
+
+### Fixed
+
+- The ESP32-C6 irrigation images of 9.233 and 9.234 were 672 and 688 bytes
+  larger than their OTA slot, so every irrigation controller refused the
+  update ("Not Enough space"). Boards on firmware older than 9.225 then stayed
+  on "updating" until their power was cut. The irrigation build now drops the
+  C++ unwind tables nothing uses (`-fno-exceptions`): the image goes from
+  1,835,936 to 1,698,272 bytes. Both oversize images were withdrawn from the
+  server, and irrigation controllers were offered 9.232 meanwhile.
+- PlatformIO's "Flash: x% used" does not measure the `.bin` a device
+  downloads, which is how this went unnoticed. The release workflow now
+  checks every image against its partition table's OTA slot
+  (`tools/check_app_size.py`). It fails on overflow and warns below 32 KB of
+  headroom.
+- ESP32 family: if the web server does not listen again after a failed
+  update, the board records the error and restarts, instead of staying
+  without a panel. The ESP8266 already did this.
+
+### Para testers
+
+- **Controladores de rega C6 voltam a atualizar**: as versões 9.233 e 9.234
+  não cabiam na memória e a atualização falhava. Nas versões antigas ficava
+  parado em «a atualizar» até desligar a placa. A 9.235 cabe com folga.
+
+## [9.234] - 2026-11-24
+
+### Fixed
+
+- The panel was slow to open for the first ~15 s after boot. The CloudIO
+  sync gave up whenever the configuration lease was busy, which at boot is
+  most of the time, and re-requested the whole sync. That meant dozens of
+  retries a second and, after a 204, a new HTTPS POST each time: ten in ten
+  seconds. The panel's first load waited for the same lease. The sync now
+  waits up to 300 ms for the lease. On a XIAO ESP32-C6, the first 40 s went
+  from 10 POSTs and 33 deferred snapshots to 1 POST and none. ESP8266
+  behaviour is unchanged.
+
+### Para testers
+
+- **Painel disponível mais cedo depois de ligar a placa**: nos primeiros
+  segundos a placa já não fica ocupada a repetir pedidos à cloud, por isso o
+  painel abre logo. Nas placas ESP32, C3 e C6.
+
+## [9.233] - 2026-11-24
+
+### Added
+
+- Wi-Fi setting "Antena (XIAO ESP32-C6)", offered on C6 builds only. The
+  XIAO routes its radio through an RF switch (GPIO3 powers it, GPIO14 picks
+  the ceramic antenna or the U.FL connector) that our DevKitC-1 builds never
+  drove. Options:
+  - "não gerir", the default, for every other C6 board;
+  - "interna";
+  - "externa".
+
+  The setting is applied before the radio starts. While it is managed,
+  GPIO3/14 are reserved. On the bench, "interna" took a XIAO from -86 dBm at
+  1 Mbps to -69 dBm at 25-68 Mbps.
+
+### Fixed
+
+- `<name>.local` took five seconds to resolve on a Mac. The device had no
+  IPv6 address and answered the AAAA question with its A record. C6 builds
+  now take a link-local IPv6 address on every connection, and the lookup
+  drops to a few milliseconds.
+- The captive portal answers only clients of the device's own access point.
+  The library filter it used treated every IPv6 connection as an AP client,
+  so with IPv6 on, any device on the LAN would have reached the portal with
+  no password. Caught on the bench before any release carried IPv6.
+- The panel and the cloud now see each build's own OTA variant as "mcu". A
+  NanoC6 or generic C6 reported "ESP32-C6" and was pointed at the irrigation
+  image when looking for updates.
+
+### Para testers
+
+- **Painel mais rápido no Mac**: abrir pelo nome (`nome.local`) deixa de
+  demorar 5 segundos em cada página. Nas placas C6.
+- **XIAO ESP32-C6 com sinal fraco**: em Rede → Wi-Fi há agora a opção
+  **Antena**. Escolhe «interna», ou «externa» se tiveres antena ligada ao
+  conector U.FL. A placa reinicia ao guardar. Noutras placas C6 deixa em
+  «não gerir».
+- Contadores de água e placas C6 genéricas deixam de ver a versão da rega
+  como «atualização disponível».
+
+## [9.232] - 2026-11-24
+
+### Added
+
+- Nooploop TOFSense laser rangefinder (DFRobot SEN0337) over UART: distance in
+  millimetres, 1 cm to 5 m. The sensor stores its own baud rate and can change
+  it, so the driver searches for it and locks on the first frame with a valid
+  checksum.
+
+### Fixed
+
+- Every build now updates from an image of its own. The OTA variant decides
+  the image a device is handed, and builds with different pins were sharing
+  one:
+  - the C6 water meters asked for `ESP32-C6`, the irrigation image;
+  - the C3 meter asked for the ESP8266 meter's image;
+  - the 4 MB ESP32 got the 8 MB image.
+
+  New variants: `ESP32-4M`, `ESP32-C3-HAN`, `ESP32-C6-GENERIC` and
+  `ESP32-C6-NANO`. The irrigation controller keeps `ESP32-C6`.
+- The browser installer's C3 image had its bootloader at 0x1000, the classic
+  ESP32's offset. The C3 reads it from 0x0, so that image never booted. The
+  offset is now chosen per chip.
+
+### Para testers
+
+- **Novo sensor:** o laser de distância TOFSense, ligado por UART. Mede de
+  1 cm a 5 m.
+- **Instalar pelo browser** (cloudio.bhonofre.pt/flash): escolhes primeiro a
+  família do chip e depois a versão. Já há firmware genérico para ESP32 de
+  4 MB, ESP32-C3 e ESP32-C6.
+- **Se gravaste um ESP32-C3 pela página antes de hoje**, a placa não arrancava.
+  A imagem já está corrigida: grava outra vez.
+
+⚠️ **Contadores de água em ESP32-C6 e contadores HAN em ESP32-C3:** a
+correcção só vale depois de a placa já ter esta versão. **Grava-os por cabo
+ou pela página**. Pela actualização automática, um C6 de água ainda receberia
+a imagem da rega.
+
+## [9.231] - 2026-11-03
+
+### Fixed
+
+- An ESP32-C3 asked the update server for the plain ESP32 image and was given
+  it: a build for a different architecture, nearly twice its app partition.
+  Two separate places were wrong. The config payload worked the chip out a
+  second time with only the C6 special-cased, so a C3 called itself "ESP32" --
+  it now uses currentMcuName(), which already knew better. And the firmware's
+  own auto-update URL carried no variant outside the C6 and the HAN build, so
+  the cloud fell back to matching on the x-ESP32-version header, where a C3 is
+  indistinguishable from an 8 MB ESP32. The comment on the C6 case describes
+  this exact trap; the C3 was simply left out of the fix.
+- The release now publishes an ESP32-C3 image. Without one the C3 had nowhere
+  of its own to update from, which is what made falling back to "ESP32" look
+  like it worked.
+
+### Para testers
+
+Se tens um **ESP32-C3** e alguma vez usaste a actualização automática, isto é
+para ti: o equipamento pedia a imagem do ESP32 normal, que é de outra
+arquitectura e quase o dobro do tamanho da partição. Daí partir tudo.
+
+⚠️ **Importante:** esta versão corrige o pedido, mas um C3 que ainda tenha
+firmware antigo **continua a pedir mal** — a correcção só vale depois de ele já
+a ter. Num C3 que esteja numa versão anterior à 9.231, **não uses a
+actualização automática**: grava por cabo uma vez, e a partir daí fica
+autónomo.
+
+Nos restantes equipamentos não muda nada.
+
+## [9.230] - 2026-11-03
+
+### Added
+
+- Header and diagnostic health states now use a consistent left-edge indicator:
+  green for healthy, amber for degraded, red for a real connection failure, and
+  gray for disabled or unknown. Informational diagnostic cards keep the same
+  compact edge structure in neutral gray. Existing status text remains visible,
+  and a connected but weak Wi-Fi signal is no longer presented as a red failure.
+- Pinout rows now repeat their existing output, input and free category color on
+  the left edge, making occupied pins easier to scan without removing the text
+  labels or changing pin-assignment behavior.
+- Configured light and socket Function cards now show their live state with a
+  neutral/green left edge and explicit `DESLIGADO`/`LIGADO` label. SSE events,
+  accepted browser commands, and a state-only reconciliation when Functions is
+  opened keep the card current even when Safari delays an event; unsaved form
+  edits are not rebuilt. Controls without a truthful binary state remain neutral.
+- Documented independent topic PRs and shared Unreleased notes so unrelated work
+  can continue during review, including dependency and post-merge conflict rules.
+- PlatformIO library dependencies are now reproducible: registry libraries use
+  exact versions, Git libraries use full commit hashes, and the known moving
+  transitive libraries are pinned explicitly for each board family.
+- Platform declarations and the release workflow's PlatformIO Core/IntelHex
+  build tools are pinned too, so the resolver itself cannot drift silently.
+- Every PlatformIO build and the quick project checks now reject floating
+  dependency declarations before they can silently change a firmware build.
+
+### Fixed
+
+- A sick cloud no longer takes the device with it. The config sync is a
+  synchronous POST, and against a server that accepts the connection and then
+  does not answer -- which is what an unwell server looks like, as opposed to
+  one that is down and refuses at once -- it ran for up to 51 seconds: three
+  HTTPS attempts of twelve, plus backoff, plus a plain-HTTP fallback. It ran
+  from loop(), so the web panel, the local MQTT and the actuators all waited
+  behind it. With the watchdog asking again every 60 seconds, a device spent
+  most of its life unresponsive, and physical switches stopped working because
+  of a server somewhere else. On ESP32 the sync now runs on its own task. The
+  ESP8266 has one thread and nowhere to move it to, so its budget is capped
+  instead: one attempt at six seconds rather than three at twelve.
+- A failed sync now backs off -- 1, 2, 4, 8, 16, then 30 minutes -- instead of
+  retrying every single minute for as long as the outage lasts. A success
+  clears it, so a brief blip still costs one minute.
+- A device no longer restarts forever because the cloud is unwell. A cloud MQTT
+  transport that does not finish connecting within 30 seconds triggers a
+  controlled restart, which recovers a transport stuck on its own but, during
+  an outage, happens again on every boot: the device never finishes starting.
+  After three in a row it now gives up on the cloud for that boot and runs
+  locally, which is what it should have been doing all along. The count lives
+  in RTC memory, so it survives the restart it is counting but not a power cut,
+  and no flash is written.
+- The device log is guarded on ESP32. It is written from the main loop, the
+  sensor task and now the cloud task, and two writers racing on the line index
+  lose a line and can run it past the end of the buffer.
+- Water-meter checkpoints use the persistence result, report failed writes, and
+  retain the unsaved-turn count for a later retry instead of reporting success.
+- Runtime actuator commands no longer discard atomic-storage failures. The WebUI
+  reports when a command was physically applied but its state could not be saved,
+  while MQTT, Cloud, GPIO and KNX paths record the source and feature in the
+  device log. Unknown actuator requests remain distinct from storage failures.
+
+### Para testers
+
+Esta versão junta tudo o que ficou desde a 9.228, que foi a última que saiu.
+
+**O equipamento deixa de esperar pela nuvem.** Se já tiveste equipamentos a
+ficar lentos, com os interruptores a não responder, ou a não arrancar quando a
+nuvem está em baixo — era disto. Os botões, o painel e o MQTT local passam a
+funcionar na mesma, com ou sem internet, e quando a nuvem está doente o
+equipamento tenta cada vez menos vezes em vez de insistir de minuto a minuto.
+Deixa também de **reiniciar em ciclo**: ao fim de três tentativas desiste da
+nuvem até ao arranque seguinte. Antes reiniciava de 30 em 30 segundos e parecia
+morto. Se vires no Registo do equipamento a linha `cloud mqtt: 3 reinicios sem
+sucesso, a funcionar so localmente`, é isto a fazer o seu trabalho.
+
+**Sensor de presença LD2420** (o irmão mais novo do LD2410, só em ESP32): já
+aparece na lista de funções. Liga-o aos pinos RX/TX — o formulário agora diz
+mesmo PINO RX e PINO TX, em vez de PINO e SEGUNDO PINO. Dá presença,
+movimento e distância, e entra sozinho no Home Assistant.
+
+**Fita LED com KNX**: num equipamento que só tenha a fita, os comandos KNX não
+chegavam. Já chegam.
+
+**O painel mostra o estado ao vivo.** Cada função ganhou uma marca na margem e
+a palavra LIGADO/DESLIGADO, e isso acompanha o que fazes na Visão geral sem ser
+preciso recarregar a página — coisa que no Safari obrigava mesmo a refrescar.
+As cores de saúde no cabeçalho e no diagnóstico passam a ser consistentes:
+verde bem, âmbar a coxear, vermelho em falha, cinzento desligado.
+
+**Quando um comando não fica guardado, o painel diz.** Antes, uma gravação
+falhada passava em silêncio e parecia que tinha corrido tudo bem.
+
+### Validation
+
+- 142 host tests, all quick project checks, and the ESP8266_DEBUG/ESP32_DEBUG
+  build pair passed on the v9.202 base. ESP8266 static RAM is 52,764 / 54,000 bytes, leaving 1,236
+  bytes of guard margin.
+- Normal command behavior compiles on both targets. The forced storage-failure
+  branch is covered by source contracts but was not induced on hardware because
+  deliberately exhausting or corrupting LittleFS would be a destructive test.
+- Dependency-pin host tests passed, and clean resolution/builds passed for the
+  ESP8266 normal/HAN release and debug profiles, ESP32 normal/C3 profiles, and
+  ESP32-C6 release/debug profiles. The C6 intentionally retains its separately
+  tested Arduino 3.x dependency revisions.
+
+## [9.229] - 2026-11-03
+
+### Added
+
+- Hi-Link LD2420 presence radar (driver 96, ESP32 only). It reads the radar's
+  default 115200 baud text output (`ON`/`OFF`/`Range <cm>`) and publishes
+  `occupancy`, `motion` and `distance`, with Home Assistant discovery.
+- The new-function form labels the UART pins of the LD2410/LD2420 as
+  "PINO RX" and "PINO TX" instead of "PINO" and "SEGUNDO PINO".
+
+### Fixed
+
+- LED strip: KNX commands now arrive on units that have only the strip. The KNX
+  stack was polled solely from the actuator loop, so on a unit with no KNX
+  actuator the bus was never read at all.
+
+### Para testers
+
+Duas novidades.
+
+**Sensor de presença LD2420** (o irmão mais novo do LD2410, só em ESP32): já
+aparece na lista de funções. Liga-o aos pinos RX/TX — o formulário agora diz
+mesmo "PINO RX" e "PINO TX", em vez de "PINO" e "SEGUNDO PINO", que não ajudava
+nada. Dá presença, movimento e distância, e entra sozinho no Home Assistant.
+
+**Fita LED com KNX**: se tens um equipamento que só tem a fita e mandavas
+comandos por KNX, eles não chegavam. Já chegam.
+
+## [9.228] - 2026-10-29
+
+### Changed
+
+- The strip's state message now carries its speed, intensity, LED count and
+  segment layout, not just the colour, brightness and effect of the first
+  segment. The cloud stores that object verbatim and the phone apps read it
+  from there, so anything left out of it was something a phone could command
+  but never show -- which is why the apps had no segment view to offer.
+- Segments are written tighter than the rest of that message: colour as
+  [r, g, b] and effect as its index. MQTT_MAX_PACKET_SIZE caps the packet at
+  1000 bytes and eight segments spelled out the long way measure 1287. The top
+  level keeps its colour object, which the Home Assistant discovery templates
+  read r/g/b from. If the budget is ever exceeded anyway the layout is dropped
+  rather than the whole message: an oversized publish is discarded in silence,
+  and the layout is the one part /ledstate can still be asked for.
+
+### Para testers
+
+Nada muda no equipamento nem no painel: esta versão só passa a contar à nuvem
+**tudo** o que a fita está a fazer, incluindo os segmentos. É o que falta para
+as apps do telemóvel poderem mostrar e mexer na cor, nos efeitos e nos
+segmentos — até agora só conseguiam ligar e desligar.
+
+Vale a pena atualizar já, para que a fita esteja pronta quando a app nova
+chegar.
+
+## [9.227] - 2026-10-28
+
+### Fixed
+
+- The LED strip showed up twice under Accessories: once as its own tile, with
+  the colour, the effects and the segment editor behind the cog, and once as a
+  plain on/off accessory with none of it. 9.225 started describing the strip as
+  a LIGHT feature so the cloud could adopt it, but it put that description in
+  the panel's payload as well, and the panel already draws the strip from the
+  "ledStrip" key. The description now goes only to the cloud, which is the one
+  that cannot see the strip any other way. The second tile also carried a cog
+  onto the actuator dialog, where the strip would have been edited as if it
+  owned a GPIO output.
+
+### Para testers
+
+Se abriste a **fita LED** no painel e viste **dois mosaicos iguais**, era um
+erro meu na 9.225: o segundo não tinha cor nem efeitos nenhuns, e a rodinha
+dele abria a janela errada. Nesta versão fica **um só mosaico** — o bom, aquele
+em que a rodinha abre a cor, o brilho, os 24 efeitos e os segmentos.
+
+Nada mais mudou: o que já estava configurado na fita mantém-se tal e qual.
+
+## [9.226] - 2026-10-28
+
+### Fixed
+
+- The web panel's asset cache-busting version said 9.224 in the 9.225 release:
+  platformio.ini was bumped after the panel was last generated. Harmless, since
+  9.224 was never released and no browser holds its assets, but wrong.
+
+### Changed
+
+- The imported LED strip's comments are in English, like the rest of the
+  project: LedStrip.cpp, LedStrip.h, LedEffects.h and its PC test, plus the
+  comments the same work left in CloudIO.cpp, WebServer.cpp, ConfigOnofre.cpp,
+  Mqtt.cpp, Actuatores.cpp and the panel's index.js. Comments only — with every
+  comment stripped, each file is byte-identical to 9.225, and the minified
+  panel bundle does not change at all.
+
+### Para testers
+
+Versão de manutenção, sem nada de novo para experimentar: só arrumação interna
+do código e a correção de um número de versão nos ficheiros do painel.
+
+Se ainda não viste a **fita LED**, que saiu na 9.225, é essa que vale a pena
+testar — continua tudo igual ao que foi anunciado.
+
+## [9.225] - 2026-10-28
+
+### Added
+
+- The LED strip reaches CloudIO. It joins the features the device reports as
+  family LIGHT with driver LED_STRIP, and gets the cloud topic pair the
+  actuators get — `<user>/<chip>/light/led/set` and `.../light/led/status` —
+  carrying the same JSON the local broker already uses. Once the device is
+  adopted, the strip can be seen and driven from the cloud, and Alexa controls
+  it there as a colour light: on and off, brightness and colour. Effects and
+  segments have no Alexa vocabulary and stay on the device's page and in Home
+  Assistant.
+
+### Removed
+
+- The strip's own Alexa support, which emulated a Philips Hue bridge over
+  SSDP through Espalexa. Alexa is integrated through the cloud, so the local
+  path was a second thing to keep working for no gain. Gone with it: the
+  Espalexa dependency in every environment, the persisted "al" flag, the Hue
+  entry point in the not-found handler, and the panel's selector.
+
+### Fixed
+
+- A lease contract test anchored on the first `else if (httpCode ==
+  HTTP_CODE_OK)` in the cloud sync, which a logging branch had come to match,
+  so the contract was being checked against the wrong block and would have
+  passed with the lease removed.
+- The firmware-update page now confirms success only after the restarted device
+  reports a different firmware version or build, then performs a full browser
+  reload so the normal login flow and new assets appear without manual refresh.
+- A failed automatic update stops the progress indicator and displays the actual
+  device error instead of remaining indefinitely on "updating".
+- ESP8266 closes port 80 while BearSSL owns the limited heap, preserves a failed
+  update message through a controlled recovery restart, and releases captive AP
+  resources before starting the full station WebUI, CloudIO, and MQTT services.
+
+### Para testers
+
+Nova funcionalidade grande: **fita LED endereçável** (tipo WLED), nos ESP32,
+ESP32-C3 e ESP32-C6. O ESP8266 não a leva — não tem memória.
+
+Cria em Funções → Nova função → Fita LED, escolhe o pino de dados e o número de
+LEDs. Depois, na Visão geral, o mosaico liga e desliga e a rodinha abre cor,
+brilho, 24 efeitos, velocidade e intensidade. Dá para dividir a fita em até 8
+zonas e mexer em cada uma à parte. Tem transições suaves, limite de corrente da
+fonte (diz quantos amperes ela aguenta e o firmware baixa o brilho antes de
+passar disso) e ajuste de cores, para quando o vermelho sai rosado ou trocado
+com o verde.
+
+A fita aparece sozinha no Home Assistant e tem página própria em
+`http://<nome>.local/led`, que funciona bem no telemóvel.
+
+**Alexa:** funciona pela nuvem, depois do equipamento estar associado à conta.
+Diz "Alexa, descobre dispositivos" e a fita aparece como luz: ligar, desligar,
+brilho e cor. Efeitos e segmentos não existem para a Alexa — para isso usa o
+painel ou o Home Assistant.
+
+O que convém testar: criar e remover a função, o limite de corrente com a tua
+fonte real, as cores depois do ajuste, e a Alexa depois de adotares o
+equipamento. Avisem se o vermelho sair trocado: é a ordem das cores, muda-se na
+rodinha sem reiniciar.
+
+### Validation
+
+- An intentional ESP8266 HTTPS failure completed without OOM, retained Wi-Fi,
+  recovered CloudIO/MQTT, and showed `HTTP error: connection failed` in Safari.
+- A real ESP8266 automatic update from a 9.198-labelled candidate to official
+  v9.201 restarted successfully, reopened the login page automatically, and
+  reported `FW 9.201`.
+- 132 host tests and the ESP8266_DEBUG/ESP32_DEBUG build pair passed. ESP8266
+  static RAM was 52,332 / 54,000 bytes, leaving 1,668 bytes of guard margin.
+
+## [9.224] - 2026-10-28
+
+### Added
+
+- LED strip on the ESP32-C6 (ESP32C6_IRRIGATION and its debug variant): LED_STRIP define plus the Adafruit NeoPixel library. Untested on the C6 hardware.
+
+### Changed
+
+- The LED strip is no longer offered under New feature on firmwares that do not include it (the ESP8266 has no memory for it): the firmware now reports ledSupport and the panel hides the option. The ESP8266 builds never contained the strip code; this only removes the dead option and the chance of trying to create it.
+
+## [9.223] - 2026-10-27
+
+### Added
+
+- Alexa start-up guard: the marker /alexa.try exists while the Alexa emulation is starting; if the device restarts by panic or watchdog before a minute has passed, the next boot switches Alexa off and says so in the device log and in the strip dialog, instead of restarting in a loop. Alexa now starts only after 15 s of uptime.
+
+### Fixed
+
+- LED strip settings that are not sliders (Alexa, LED count, segments, colour order, gamma, transition, current limit, KNX) are now written to flash at once instead of 3 seconds later, so they are no longer lost if the device restarts right after. The Alexa option also had a race in the panel that could show it as off right after switching it on.
+
+## [9.222] - 2026-10-26
+
+### Added
+
+- Alexa through Hue emulation for the LED strip (Espalexa library, Hue "extended colour light"): switch it on in the strip's dialog under Alexa, then ask Alexa to discover devices. Local, no cloud; on/off, brightness and colour only (no effects or segments). The web server's not-found handler now offers unknown requests to the Alexa emulation first.
+
+## [9.221] - 2026-10-25
+
+### Changed
+
+- Cloud presence: the log now says when the retained presence message could not be published (AsyncMqttClient::publish returned 0), instead of always reporting it as sent.
+
+## [9.220] - 2026-10-25
+
+### Changed
+
+- The cloud presence message (retained "1" on the available topic) is now renewed every 5 minutes while the cloud link is up, instead of once when it opens. If the server loses the retained message, the cloud panel no longer shows the device offline until its next reconnect.
+
+## [9.219] - 2026-10-24
+
+### Added
+
+- Manual firmware upload (Firmware > Update by file) now writes its failures to the device log with the Update error code and the byte count: device busy, Update.begin failed, write failed, or final verification failed. The panel only said that the upload failed.
+
+## [9.218] - 2026-10-24
+
+### Changed
+
+- The panel header and the Pinout tab now show the real chip (ESP32-C3, ESP32-C6, ESP32, ESP8266) taken from backupVariant. The mcu field is unchanged: it still names the OTA folder and is what the cloud receives, so a C3 keeps reporting ESP32 there.
+
+## [9.217] - 2026-10-24
+
+### Added
+
+- The device log (panel, Diagnostics) now records the cloud: the server's answer to each sync (200 / 204 not adopted / failure), the cloud MQTT link coming up and going down with the disconnect reason, and the presence message. Before, the panel text promised cloud events but none were written, so a cloud problem left no trace without a USB cable.
+
+## [9.216] - 2026-10-24
+
+### Fixed
+
+- ESP32-C3 builds (ESP32C3_LED_DEBUG/RELEASE) now have their own pin table, selected by the new ESP32C3 define. They used the classic ESP32 table: the Smart Bus on GPIO32/33 and selectable pins up to 27, none of which exist on a C3 (GPIO 0-21, with 12-17 on the SPI flash). The boot-time I2C scan now uses GPIO6/7 and the panel only offers 0-5, 10, 20 and 21. ESP32C3_HAN is unchanged.
+
+## [9.215] - 2026-10-24
+
+### Added
+
+- Addressable LED strip (WS2812/WS2813/WS2815) as a feature: Features > New feature > "Fita LED" with name, GPIO and LED count. An Overview tile switches it on and off; its gear opens a dialog with colour, brightness, effect, speed, intensity, LED count, up to 8 segments, smooth transitions, a supply current limit and colour order, gamma and white balance.
+- 24 effects, KNX on/off with state feedback, MQTT and Home Assistant discovery for the whole strip. ESP32 and ESP32-C3 only; the GPIO is reserved so no other feature can take it.
+- New environments: ESP32_4M_DEBUG/RELEASE (4 MB flash) and ESP32C3_LED_DEBUG/RELEASE (access-point provisioning, two OTA slots).
+
+### Changed
+
+- Web panel assets ship pre-generated (SKIP_HTML_CONVERT on by default), so building needs no Node.js. The generated files are not minified.
+
+## [9.202] - 2026-08-31
+
+### Added
+- **Water meters are now a feature: an inductive pickup on the meter's own rotating
+  target, read by an LDC1612 over I2C.** It is the same principle Itron's own Cyble
+  module uses — "detection is by change of induction", in their words — so it works
+  through a sealed cover, is immune to magnets, and needs no cooperation from the
+  water company. Validated on an Itron Aquadis+ before being written: 48 turns
+  counted against 56 litres on the meter's own register.
+- Publishes litres and flow, and reaches Home Assistant as two entities: the total
+  with `device_class: water` and `state_class: total_increasing`, which is what puts
+  it in the water dashboard on its own with daily and monthly consumption, and the
+  flow as `volume_flow_rate` in L/min.
+- The panel takes the meter's current reading in m³ and the litres-per-turn from the
+  meter's face. The coil counts turns of a target and cannot know what ran through
+  before it was fitted, so that number is typed in once — and it is written to flash
+  at the end of each draw, not once per litre, because flash wears out and a meter is
+  meant to keep counting for years.
+
+### Notes on what was measured
+- Thermal drift on this meter reached 84,000 counts over two seconds against a
+  1,400-count signal, so the driver subtracts a ten-second average and works on the
+  residual. Judged against a fixed baseline instead, the drift alone counted 1,638
+  litres in a minute that used none.
+- The trigger compares the residual with its own amplitude. Comparing the raw value
+  with the slow average — the obvious first attempt — lost one turn in seven, because
+  a shallow cycle riding on a moving average never reaches a fixed offset from it.
+- Accuracy at maximum flow was 86% with the coil hand-held over the target. A coil
+  made to fit the target would raise the margin considerably; the signal is 1,470
+  counts out of 43.9 million, which works but leaves little room.
+
+### Para testers
+- **Já se pode ler um contador de água.** Precisa de um sensor LDC1612 no I²C e de
+  uma bobina encostada ao contador, sobre o alvo — nos Itron Aquadis+ é o círculo
+  marcado na face, onde encaixaria o módulo da Itron.
+- Escreve-se a leitura actual do contador no painel (em m³, com os dígitos vermelhos)
+  e os litros por volta, que estão impressos na face — no Aquadis+ é **HF 1L**.
+- Em Home Assistant aparece sozinho no **painel de água**, com consumo diário e
+  mensal, sem configurares nada.
+
+## [9.201] - 2026-08-28
+
+### Added
+- **ESP8266 builds now have an evidence-based static-RAM release gate.** Normal
+  and HAN release/debug profiles measure `.data + .rodata + .bss` directly from
+  the linked ELF, report their byte margin and change from the reviewed v9.200
+  baseline, and refuse to publish a candidate above the configured ceiling.
+- The release workflow repeats the guard explicitly in CI. Budget validation is
+  also part of the quick project checks, with host tests covering configuration,
+  ELF parsing, pass/fail boundaries, publication ordering, and CI wiring.
+
+### Validation
+- v9.200 baselines: 47,780 bytes (`ESP8266_RELEASE`), 47,796 bytes
+  (`ESP8266-HAN_RELEASE`), 52,188 bytes (`ESP8266_DEBUG`), and 52,204 bytes
+  (`ESP8266-HAN_DEBUG`). Release ceilings are 50,000 bytes and debug ceilings
+  are 54,000 bytes; both would reject the known v9.198 OTA regression builds.
+- Static RAM remains an early warning only. Changes affecting RAM or network
+  lifecycles still require automatic HTTPS OTA on real ESP8266 hardware because
+  an ELF cannot measure runtime heap fragmentation.
+- Verified here before merging: the guard passes the four protected builds with
+  measured margin, and a ceiling set one byte below the real figure fails the check
+  with exit code 1 — before the release workflow renames or uploads anything.
+
+### Para testers
+- **Nada de novo para ver.** Esta versão é uma rede de segurança na fábrica: a partir
+  de agora uma alteração que faça crescer a memória fixa dos ESP8266 acima do limite
+  revisto **não chega a ser publicada**.
+- É a resposta à falha da 9.198, em que o equipamento compilava bem e só depois
+  ficava sem memória a meio da actualização segura — o pior sítio para se descobrir.
+
+## [9.200] - 2026-08-25
+
+### Fixed
+- **The irrigation entities now have predictable ids in Home Assistant.** They were
+  published with bare names — "A regar", "Parar rega" — so Home Assistant made
+  `binary_sensor.a_regar` for the first controller and `binary_sensor.a_regar_2` for
+  the next, decided by whichever was discovered first. A dashboard cannot be written
+  against that. With `has_entity_name` the platform composes "<device> <entity>"
+  itself and the ids become `binary_sensor.<device>_a_regar`.
+- Only the irrigation entities change. The switches, covers and sensors keep the ids
+  they have been in the field with for months; renaming those would break automations
+  people already wrote.
+
+### Para testers
+- **Quem usa Home Assistant:** as entidades da rega passam a ter nomes prefixados
+  pelo equipamento ("Quadro Geral A regar" em vez de "A regar"), o que torna os
+  identificadores previsíveis e permite escrever um cartão no painel sem depender da
+  ordem em que os equipamentos foram descobertos.
+- Se já tinhas automações a apontar para as entidades da rega criadas hoje, os
+  identificadores mudam uma vez — as dos interruptores e estores ficam iguais.
+
+## [9.199] - 2026-08-25
+
+### Fixed
+- **ESP8266 HTTPS firmware updates no longer run out of memory after v9.198.**
+  Before BearSSL starts, the firmware now drains the live WebUI event stream,
+  disconnects both MQTT transports, and temporarily releases the 3.5 KB device
+  history buffer. A strict heap gate still refuses unsafe attempts cleanly.
+- The device history remains available during normal operation and is recreated
+  automatically if an update fails and the running firmware resumes.
+
+### Validation
+- Two consecutive real-board updates from a 9.197-labelled ESP8266 test build to
+  the official 9.198 release completed successfully and rebooted into 9.198. The
+  measured pre-TLS reserves were 16,792/12,712 bytes and 16,632/12,296 bytes
+  (free heap/largest contiguous block).
+- Measured here before merging: ESP8266 static RAM went from 51,284 to 47,748 bytes,
+  which is the 3.5 KB the history buffer was holding. The regression came from
+  9.198's Home Assistant entities: they grew static RAM until BearSSL could no
+  longer allocate its X.509 validator — an update that failed at the last step, on
+  the family with the least memory to spare.
+
+### Para testers
+- **Os ESP8266 voltam a conseguir actualizar-se sozinhos.** A 9.198 deixou-os sem
+  memória a meio da ligação segura: a actualização começava e falhava, ou reiniciava
+  o equipamento. Se tens um equipamento assim, esta versão resolve.
+- O histórico do equipamento continua disponível como antes — é largado só durante a
+  actualização e recriado logo a seguir.
+- Sem alterações para ESP32 nem ESP32-C6.
+
+## [9.198] - 2026-08-24
+
+### Added
+- **The irrigation now arrives in Home Assistant properly.** A device with valves
+  already published them as switches over MQTT discovery, which said whether water
+  was flowing and nothing else. It now also publishes, with no add-on, no HACS and
+  no custom component:
+  - **when each zone closes**, as a `timestamp` sensor. Home Assistant renders a
+    timestamp as live relative time, so the dashboard counts down on its own — a
+    number of seconds would sit frozen between the device's messages;
+  - **"A regar"**, a `running` binary sensor for whether a cycle is going;
+  - **a button per program** and a **"Parar rega"** button;
+  - **"Setores em simultâneo"**, a `number` from 1 to 5, in the config category.
+- The closing-time sensors carry two availability topics with `availability_mode:
+  all` — the device has to be reachable *and* the valve has to be open. A closed
+  valve has no closing time, and showing the last one would be a dashboard that
+  lies.
+- The program buttons are re-published whenever the schedule is saved, and a slot
+  with no program has its config cleared: the buttons are the programs, so a deleted
+  program must take its button with it rather than leave one that waters nothing.
+
+### Changed
+- One payload now serves both audiences — `Irrigation::statusJson` — so the cloud
+  (for the phone apps) and the local broker (for Home Assistant) cannot describe the
+  same garden differently. `notifyIrrigation()` publishes to both, so no caller can
+  update half the world.
+- `RUN:`/`STOP`/`MAX:` parsing lives in `Irrigation::command`, reached from both
+  brokers. `MAX:` persists, or a reboot would undo what someone set from Home
+  Assistant. Still deliberately no way to edit the schedule over MQTT.
+- New: `clockIsoIn(seconds)`, an ISO-8601 instant **with the UTC offset**. Home
+  Assistant rejects a naive timestamp, and without a synced clock no closing time is
+  published at all rather than a made-up one.
+
+### Para testers
+- **Quem usa Home Assistant passa a ver a rega a sério.** Além dos interruptores das
+  electroválvulas, aparecem: a hora a que cada zona fecha (com o HA a fazer a
+  contagem sozinho), um sensor "A regar", um botão por programa, um botão "Parar
+  rega" e um campo para os setores em simultâneo. Não é preciso instalar nada — vem
+  no equipamento e aparece sozinho.
+- Se apagares um programa, o botão dele desaparece do Home Assistant também.
+
+## [9.197] - 2026-08-24
+
+### Added
+- **The irrigation picture now reaches the cloud**, so the apps can show it. Until
+  now only the device's own panel knew about zones and cycles: the cloud carried one
+  state string per feature, and irrigation is not a feature — the cycle spans several
+  valves and the schedule belongs to none of them. It gets its own retained topic,
+  `{user}/{chip}/irrigation/status`, carrying the schedule, the running cycle, and
+  the countdown of every open valve. Retained, so an app opened halfway through a
+  cycle still sees it.
+- `{user}/{chip}/irrigation/set` accepts `RUN:<programId>` and `STOP`. Deliberately
+  not the schedule: editing programs over a retained-message channel would make a
+  lost message look like a deleted program, and the panel already does that job.
+- The device republishes on every valve movement and on every schedule save — a save
+  moves no valve, so nothing else would tell the apps.
+
+### Changed
+- `Actuator::valveClock` is now the single answer to "how long has this valve got
+  left", asked by both readers: `/config` for the panel and the retained message for
+  the apps. Two copies of that rule would have drifted apart.
+- No change is needed in CloudIO or in the EMQX rules: a phone's ACL is already
+  `{username}/#`, so the new topic is reachable the moment the firmware publishes it.
+
+### Para testers
+- Nada de novo para ver nesta versão — é a canalização para a rega aparecer nas apps
+  do telefone. As apps chegam a seguir.
+
+## [9.196] - 2026-08-24
+
+### Fixed
+- **The zone label wrapped onto two lines**, which pushed the tiles out of line with
+  each other. "aberta · fecha em 25:41" said in words what the stop glyph and the
+  lit tile already say, so the line now carries only the time: "fecha em 25:41", or
+  "a regar · 9:44" for a zone the cycle is watering.
+
+### Para testers
+- O tempo debaixo do botão já não parte para duas linhas.
+
+## [9.195] - 2026-08-24
+
+### Added
+- **Each zone is now a dial that empties while it waters.** The zone tiles had a
+  text button and a number that only moved when the panel re-read the device. They
+  now carry a ring around a play/stop button — the ring drains as the time runs out
+  and the label counts down in minutes and seconds, the way the Shelly app does it.
+- An open valve is always on a clock: the program's minutes while a cycle waters it,
+  its own `autoOff` otherwise — the main loop has always enforced both. `/config`
+  now reports `secondsLeft` and `totalSeconds` per valve so a panel can draw the
+  proportion instead of inventing it, and the panel counts the seconds down locally
+  between reads so the ring moves every second rather than every poll.
+- Pressing the dial starts the countdown immediately, from the program's minutes for
+  a zone in a cycle or from `autoOff` for one opened by hand, instead of waiting up
+  to fifteen seconds for the device to be asked again.
+
+### Changed
+- The tick no longer rebuilds the zone tiles. It sets the ring's offset and the
+  label's text, so the button cannot be replaced under the finger pressing it —
+  the same reason the status card stopped being redrawn every second in 9.193.
+
+### Para testers
+- **Os setores passaram a ter um botão redondo com o tempo a andar à volta**, como
+  na app da Shelly: ▶ para abrir, ■ para fechar, e o anel vai-se esvaziando enquanto
+  rega. Ao lado diz quanto falta, em minutos e segundos.
+- Vale para os dois casos: numa zona que faz parte de um programa conta os minutos
+  do programa; numa que abras à mão conta os 30 minutos de fecho automático (ou o
+  que tiveres configurado nessa válvula).
+
+## [9.194] - 2026-08-24
+
+### Fixed
+- **Restoring a backup put the irrigation back to one zone at a time.** The restore
+  in 9.193 rebuilds the irrigation object field by field, and a field it does not
+  know about is a field it drops — so a restore quietly reconfigured the water
+  pressure, which is the one thing a restore must never do. It now carries
+  `maxConcurrentZones` (validated 1-5), and a backup taken before the setting
+  existed keeps whatever the device is set to instead of resetting it.
+
+### Announced late
+- 9.193 also shipped two features merged from pull requests #132 and #133 that were
+  missing from its notes: **exporting the configuration to a JSON file** and
+  **restoring one back**, both in SISTEMA. The copy never contains passwords, and a
+  restore refuses a file from a different kind of equipment.
+
+### Para testers
+- **Já podem guardar e repor a configuração do equipamento** (SISTEMA → CÓPIA DE
+  CONFIGURAÇÃO). A cópia sai sem palavras-passe nenhumas e só entra num equipamento
+  da mesma variante. Isto veio na 9.193 e faltou dizer.
+- Corrigido: repor uma cópia punha os setores em simultâneo de volta a 1. Agora a
+  cópia leva esse valor e reposto fica como estava.
+
+## [9.193] - 2026-08-24
+
+### Added
+- **How many sectors water at the same time is now a setting, 1 to 5.** One zone at
+  a time was a property of the installation written into the firmware: a feed that
+  comfortably supplies three sectors was watering them one after another for no
+  reason, and there was no way to say otherwise. The limit lives in the schedule
+  (`maxConcurrentZones`, default one) and is still enforced inside
+  `Actuator::changeState` — the single function every command to a valve passes
+  through, from a wall button to MQTT to the cloud — so it cannot be bypassed. Over
+  the limit, the zone open longest is the one closed, not all of them. A cycle keeps
+  as many zones open as the limit allows and starts the next as a slot frees, so
+  each zone still waters exactly its own minutes.
+- Omitting the field means "leave it as it is", so an `irrigation.json` written
+  before this existed, or an app that does not know the field, cannot silently
+  reconfigure the water pressure. `running.zone`/`running.secondsLeft` still carry
+  the first open zone for anything written before concurrency; `running.zones`
+  carries all of them.
+
+### Fixed
+- **The irrigation status card no longer rebuilds itself once a second.** The
+  countdown redrew the whole card, which now holds a dropdown — so the dropdown shut
+  itself under the finger of whoever opened it. Only the countdown line is refreshed,
+  and the 15-second poll compares the cycle before redrawing anything. Same class of
+  bug as the time field that used to lose focus while being typed into.
+- **A program's total no longer claims minutes it does not take.** "Total 33 min, por
+  esta ordem" was true only one zone at a time; with three in parallel the cycle ends
+  in 15. The summary now says both numbers.
+
+### Para testers
+- **Já podes dizer quantos setores regam ao mesmo tempo** — de 1 a 5, no topo do
+  separador REGA. O que estiver escolhido é respeitado por tudo: pelos programas,
+  pelo botão da parede, pela app e pelo painel. Se abrires mais um do que o limite,
+  fecha-se o que estiver aberto há mais tempo.
+- Quem não mexer em nada continua com um setor de cada vez, como até aqui. Atualizar
+  não altera a configuração de ninguém.
+- A conta do programa passou a dizer a verdade: "33 min de rega em 15 min, até 3
+  setores ao mesmo tempo".
+- Corrigido: a lista dos setores fechava-se sozinha enquanto se escolhia, porque o
+  cartão se redesenhava a cada segundo.
+
+## [9.192] - 2026-08-23
+
+### Changed
+- **Virtual switches no longer sit among the accessories.** A virtual switch drives
+  no output of its own — it is a wall button that commands other relays over KNX —
+  so a tile for it offered a switch whose state reflected nothing in the house. The
+  dashboard leaves them out; they stay in FUNÇÕES, where they are configured, and in
+  the pinout, where their input is spoken for. CloudIO already filtered them from
+  what it serves the apps (`isNonVirtual()` in DeviceDto), so this closes the gap on
+  the device's own panel.
+
+### Para testers
+- **Os interruptores virtuais deixaram de aparecer na lista de acessórios.** Não
+  comandam nada por si — servem para acionar outros — e o cartão deles mostrava um
+  estado que não correspondia a nada. Continuam visíveis em FUNÇÕES, para os
+  configurares.
+
+## [9.191] - 2026-08-22
+
+### Fixed
+- **No ESP32-C6 could ever update over the air.** The release job picked the OTA
+  application image with `find -name 'Firmware_*.bin' -print -quit`, and the C6
+  build emits a merged bootloader+partitions+app image next to the application one.
+  It picked the merged file, so OTA published a bootloader as if it were an
+  application: the device downloaded it, wrote it into the OTA slot, and then
+  refused to boot it — "Could Not Activate The Firmware", after a progress bar that
+  reached 100%. Every C6 release from 9.180 to 9.190 shipped that way. The
+  selection now excludes `*.factory.bin`, and the job fails outright rather than
+  publishing one, because the failure was invisible on the publishing side.
+
+### Para testers
+- **A atualização automática no OnOfre Rega estava a servir a imagem errada** e
+  falhava sempre no fim, com "Could Not Activate The Firmware". Corrigido: a partir
+  desta versão o botão de atualizar funciona no C6.
+- Para chegar a esta versão ainda é preciso instalar por USB uma última vez, em
+  cloudio.bhonofre.pt/flash/ — o equipamento não se consegue atualizar sozinho para
+  a correção da própria atualização.
+
+## [9.190] - 2026-08-21
+
+### Added
+- **The device keeps its own short log, readable from the panel.** Diagnosing what
+  a tester reports has meant asking for a USB cable, and by then the boot being
+  described is gone — everything written with ArduinoLog goes to Serial and is
+  compiled out of release builds. This is the opposite trade: a handful of lines
+  that always exist, in a fixed-size RAM ring (40 entries on ESP8266, 80 on ESP32),
+  served as plain text at `GET /logs` and shown in Diagnostics with a copy button.
+  Deliberately not the debug log: boot and reset reason, Wi-Fi up with SSID,
+  channel, RSSI and IP, Wi-Fi down, access point created, MQTT connected, update
+  requested/failed/written, a zone opening, and a cycle skipped for rain. Plain
+  text because it exists to be pasted into a message.
+
+### Merged
+- #129 save notifications moved somewhere they can be seen, with a dismiss button
+  and errors that linger longer than successes.
+- #130 ESP8266 HTTPS firmware updates, which were failing with HTTP -1 after the
+  OTA endpoint moved to HTTPS: bounded BearSSL buffers negotiated with the server.
+- #131 the header shows an available firmware version beside the installed one.
+
+### Para testers
+- **O equipamento passou a guardar um registo próprio**, no separador Diagnóstico,
+  com um botão para copiar. É isso que interessa colar quando reportam algo — já
+  não é preciso cabo USB.
+- **Nos equipamentos ESP8266 a atualização automática voltou a funcionar** (falhava
+  com erro -1 desde que o servidor passou a HTTPS).
+- O cabeçalho mostra agora a versão disponível ao lado da instalada.
+- As mensagens de gravação aparecem num sítio visível, e os erros ficam mais tempo.
+
+### Fixed
+- **ESP8266 automatic HTTPS updates no longer fail from BearSSL memory
+  exhaustion.** Negotiated TLS buffers and separate memory guards keep OTA
+  within the device's measured heap limits, while low-memory CloudIO startup
+  safely uses its existing HTTP fallback instead of risking an OOM restart.
+- **Automatic-update progress no longer implies unobserved byte progress.** The
+  WebUI shows an accessible moving indicator while the device downloads and
+  installs, bypasses stale browser caches after reboot, and reaches 100% only
+  after confirming the new firmware version.
+- **ESP8266 OTA failures expose the BearSSL error detail** instead of reporting
+  only the generic HTTP connection error.
+### Validation
+- `ESP8266_DEBUG`, `ESP8266-HAN_DEBUG`, and `ESP32_DEBUG` builds pass.
+- An ESP8266 test device upgraded automatically over HTTPS from a local 9.186
+  build to official 9.188 and returned to Wi-Fi without manual browser refresh.
+- The untouched Safari page confirmed 9.188 and displayed the completed 100%
+  progress bar.
+
+## [9.189] - 2026-08-21
+
+### Fixed
+- **The Wi-Fi radio was being configured before it existed.** `setupWiFi()` opened
+  with `WiFi.setSleep(false)` — the first Wi-Fi call in the function, so the driver
+  was not initialised and the call did nothing. Modem sleep therefore stayed at its
+  default, which is what a weak signal that slowly improves looks like. The boot log
+  from a C6 said it out loud a few lines later: `reloadWiFiConfig()` calls
+  `jw.disconnect()`, and that returned `ESP_ERR_WIFI_NOT_INIT` at 75 ms.
+  `jw.enableSTA()` only sets a flag inside JustWifi, so it could not be relied on
+  to bring the radio up. `WiFi.enableSTA(true)` now runs first, and the sleep
+  setting is asserted again on connect, because JustWifi's disconnect drops STA and
+  a reconnect can restore the default.
+
+### Para testers
+- **O sinal Wi-Fi fraco nos primeiros minutos, no OnOfre Rega.** A configuração do
+  rádio estava a ser feita antes de o rádio existir, e a instrução que evita o modo
+  de poupança não chegava a ser aplicada. Corrigido.
+- Quem reportou isto: vale a pena reiniciar o equipamento depois de atualizar e ver
+  se o sinal aparece logo bom, em vez de melhorar ao longo de minutos.
+## [9.188] - 2026-08-21
+
+### Changed
+- Development baseline synchronized through upstream release 9.187.
+- **Available firmware is visible in the persistent header.** The installed
+  version remains a quiet, non-clickable label when current. When a newer
+  version exists, the header uses the same lime treatment as the update button
+  and opens System -> Firmware; a failed release check is shown in amber.
+
+### Fixed
+- **ESP32-C6 Smart Bus pins can no longer be assigned to features.** GPIO6 and
+  GPIO7 are the fixed SDA/SCL pins on this target and are removed from the
+  configurable pin list. Stored actuator mappings are validated before setup so
+  legacy mappings to reserved pins remain inactive instead of being driven.
+- **Foreground Web requests can no longer starve behind feature loops.** A
+  bounded handoff makes periodic actuator and sensor loops yield to a waiting
+  request, while the WebUI retries short 409/BUSY responses instead of exposing
+  transient lease contention to the user.
+- **Web authentication no longer contends with live feature work.** API
+  credentials are captured before feature tasks start and remain immutable for
+  the boot. Credential edits use the controlled-restart path before the new
+  snapshot becomes active.
+
+### Validation
+- `ESP8266_DEBUG`, `ESP32_DEBUG`, and the isolated
+  `ESP32C6_IRRIGATION_DEBUG` build pass with the follow-up changes.
+- On an ESP32-C6-DevKitM-1, captive provisioning, repeated two-tab WebUI
+  navigation, name-only saving, actuator control, rejected duplicate mappings,
+  and controlled pin remapping were exercised. The test exposed GPIO6/7 as
+  fixed Smart Bus pins; the corrected firmware removes them from feature
+  selection and rejects legacy stored mappings before actuator setup.
+- One earlier uncaptured C6 stress run ended in a task-watchdog reset. It did not
+  recur during the recorded two-tab run, but its task/backtrace was lost and the
+  cause remains unconfirmed.
+
+### Para testers
+- **No OnOfre Rega, os pinos 6 e 7 deixaram de estar disponíveis** — são do barramento
+  fixo e usá-los partia o equipamento. Configurações antigas que os usassem são
+  recusadas.
+- **O painel deixou de dar erros esporádicos** ao gravar ou comandar com dois
+  separadores abertos.
+- A password do painel só passa a valer depois de reiniciar, e o equipamento reinicia
+  sozinho quando a mudas.
+
+
+## [9.187] - 2026-08-21
+
+### Changed
+- Development baseline synchronized through upstream release 9.186.
+
+### Fixed
+- **Captive Wi-Fi repair preserves an installed template.** Browsers submit the
+  hidden template field even when a configured device only needs new Wi-Fi
+  details. That field is now ignored in recovery mode, so saving the network
+  no longer fails or replaces the device's existing functions; first setup
+  still validates an explicitly selected template.
+- **A name-only save no longer restarts DHCP devices.** The configuration API
+  reports the live DHCP lease for diagnostics, but the panel was sending that
+  address back as a static-IP edit. DHCP saves now omit and ignore those static
+  fields, so unrelated metadata changes do not restart the network.
+- **Irrigation controls use the released backend routes.** The WebUI now calls
+  `/irrigation-run` and `/irrigation-stop`. The v9.186 slash-path compatibility
+  aliases remain available for already-open panels and use the same protected
+  action handlers.
+- **Automatic OTA no longer mistakes a lost connection for success.** The panel
+  confirms an update from the reported result or a changed firmware version;
+  an unavailable device remains unconfirmed and cannot produce a false green
+  success message.
+- **Live wiring edits are validated before hardware state changes.** `POST
+  /config` validates the proposed final pin map, electrical roles and pin counts,
+  then returns stable result codes for malformed requests, invalid pins, topology
+  mismatches, conflicts and busy state. Changes that require hardware
+  reinitialization make the affected feature inert and queue a controlled restart
+  only after the HTTP response closes.
+- **Sensor drivers now enforce their input topology.** Driver-specific pin counts
+  and roles are checked during configuration, and runtime guards fail closed
+  before malformed sensor input arrays can access a GPIO.
+- **Feature configuration is serialized across execution contexts.** A
+  non-blocking access lease coordinates the feature loops with Web, template,
+  MQTT, irrigation and OTA operations; competing work reports busy or retries
+  instead of racing live vectors and configuration strings.
+- **Failed OTA attempts release their resources.** Manual uploads track ownership
+  per request and abort/release on failure or disconnect. Automatic OTA restarts
+  the Web server after failure or no update, and queues a device restart only
+  after a successful replacement.
+- **Cloud and Wi-Fi callbacks defer shared-state work to the main loop.** Cloud
+  MQTT events and bounded complete commands are staged for main-loop handling,
+  the watchdog ticker only signals pending work, and retained Cloud credentials
+  plus Wi-Fi configuration use protected snapshots or deferred commits.
+- **Unsafe configuration restore is disabled.** The old export omitted secrets,
+  dropped sensors, regenerated actuator IDs and bypassed the new pin preflight.
+  Export now identifies itself as a non-secret diagnostic snapshot until a
+  complete, versioned and server-validated restore format is implemented.
+- **Configuration files keep their previous known-good copy on write failure.**
+  Device and irrigation JSON are written to a size-checked temporary file and
+  then renamed over the target without deleting it first. Configuration,
+  feature-creation, captive-provisioning and irrigation schedule save failures
+  return HTTP 507 and restart into the previous stored configuration instead of
+  reporting an undurable change as successful.
+- **Garden valves cannot reopen from a stored runtime state.** Valve state is
+  forced OFF during setup and serialized as OFF, while the live scheduler and
+  wall button can still operate it after boot.
+- **Replacing an irrigation schedule closes its old active valve first.** The
+  previous code replaced the program list before stopping a running cycle, so a
+  removed or reordered zone could lose its only reference while still open.
+  Malformed whole-schedule payloads are now rejected before changing the active
+  cycle or the in-memory program list.
+
+### Validation
+- Flashed the pre-v9.186-rebase `ESP8266_DEBUG` 9.186-dev build to the
+  USB-powered test board and completed configured-device captive Wi-Fi repair.
+  The POST was stored, the response was followed by a software restart, and the
+  device returned to station mode.
+- The WebUI retained both existing switch functions and their original pin map;
+  Cloud connectivity recovered and both test switches operated ON and OFF.
+- The rebased 9.187-dev head, live pin remapping, OTA recovery, ESP32 hardware,
+  and C6 hardware remain open validation items and are not claimed by this bench
+  test.
+
+### Para testers
+- **Alterações de configuração passaram a ser validadas antes de mexer no
+  equipamento.** Uma configuração inválida é recusada em vez de deixar o
+  equipamento num estado a meio.
+- As gravações em disco passaram a ser atómicas: uma falha de energia a gravar já
+  não deixa o ficheiro corrompido.
+- Depois de arrancar, as válvulas de rega ficam sempre fechadas.
+
+
+## [9.186] - 2026-08-20
+
+### Fixed
+- **The 9.184 fix did not reach anyone with the panel already open.** Renaming the
+  action endpoints only helps a browser that reloaded the page: a firmware update
+  does not reload an open tab, so a device on the new build was still being driven
+  by the previous panel, calling `/irrigation/run` and `/irrigation/stop` — which
+  the schedule handler kept claiming, deleting programs on a run and failing on a
+  stop, exactly as before. Both old paths are now registered ahead of it and point
+  at the right code. Verified in the simulator: all four paths answer 200, keep the
+  programs, and stop clears the cycle.
+
+### Para testers
+- **O "Parar rega" e o "Regar agora" já funcionam mesmo sem recarregar a página.**
+  Na 9.184 a correção só valia depois de recarregar o painel, e um separador aberto
+  continuava a usar o antigo.
+- Se ainda tiveres o painel aberto de antes, um recarregamento normal (F5) não faz
+  mal, mas já não é obrigatório.
+
+## [9.185] - 2026-08-20
+
+### Added
+- **An over-the-air update now shows what it is doing.** The device answered the
+  request immediately and did the work in its main loop, so the panel knew nothing
+  after asking: a failed update and a dead button looked identical, which is how it
+  was reported. The device keeps the progress and, on failure, the reason from
+  `getLastErrorString()`; `/config` reports it as `ota`, and the panel follows it
+  with a bar and shows the error instead of staying silent. Losing the device
+  mid-update is treated as the successful ending it usually is, since a device that
+  finishes reboots.
+
+### Changed
+- The Telegram announcement now prefers a `### Para testers` section from the
+  changelog entry when there is one. The channel is read by testers and the
+  changelog is written in English for the repository; keeping the Portuguese
+  summary in the same file means it cannot drift away from the entry it describes.
+
+### Para testers
+- **O botão de atualizar já mostra o que está a acontecer** — barra de progresso e,
+  se falhar, a razão em vez de silêncio.
+- As mensagens deste canal passam a ser escritas em português.
+
+## [9.184] - 2026-08-20
+
+### Fixed
+- **"Regar agora" was deleting every program, and "Parar rega" always failed.**
+  AsyncWebServer matches a plain URI as "exact, or prefix with a trailing slash",
+  and the handler for `/irrigation` — the one that replaces the whole schedule — is
+  registered before the actions, so it answered `/irrigation/run` and
+  `/irrigation/stop` as well. A run request carries no `programs` key, so the
+  schedule parsed as empty and was written to flash that way; a stop request
+  carries no body at all, which is why the panel reported a failure. The actions
+  moved to `/irrigation-run` and `/irrigation-stop`, which cannot be a prefix of
+  the schedule path. Reproduced and verified both ways against the simulator.
+- This also corrects the diagnosis behind the 9.182 note that said "Regar agora"
+  merely *looked* like it deleted a program. It was deleting it, on the device.
+
+### Notes
+- The panel is embedded in the firmware, so both sides move together; nothing else
+  called these endpoints yet.
+
+### Para testers
+- **O "Regar agora" apagava os programas em vez de os correr.** Corrigido: agora
+  arranca o programa e o horário fica intacto.
+- **O "Parar rega" dava sempre erro.** Corrigido.
+- Se perdeste programas ao carregar em "Regar agora", tens de os criar outra vez —
+  foram apagados no equipamento.
+
+## [9.183] - 2026-08-20
+
+### Fixed
+- **A valve's wall button did nothing.** `Actuator::setup()` attaches button
+  handlers under `if (isLight() || isSwitch())`, and a garden valve is neither —
+  while the block right above it, which drives the output, does include valves. So
+  commanding a valve worked and pressing its button did not, on a board whose
+  template gives every valve a button and whose panel prints its pin. Valves now
+  take a momentary press to toggle, matching the PUSH that `driverToInputMode()`
+  already reported for the driver.
+
+### Para testers
+- **Os botões de parede das válvulas não faziam nada.** Já funcionam: um toque
+  alterna a válvula.
+- Atenção em bancada: sem sensor de chuva ligado, o equipamento lê "a chover" e os
+  programas agendados não arrancam. Desliga "saltar o ciclo se estiver a chover"
+  enquanto testas.
+
+### Notes
+- Two reports from the test group are still open and are not fixed here: "Regar
+  agora" and "Parar rega" doing nothing. Renaming a feature on the same board
+  worked, which proves authenticated JSON POSTs reach the device, so the fault is
+  in the command path rather than the web server. Waiting on the HTTP status of a
+  failing request to tell those apart.
+- A rain sensor with nothing wired to it reads as raining (the input is pulled up
+  and an open input is HIGH), and "skip the cycle when it rains" is on by default —
+  so scheduled programs are skipped silently. Turn that option off while testing on
+  a bench.
+
+## [9.182] - 2026-08-20
+
+### Fixed
+- **The C6 brought its access point up and then answered 404 to everything.** The
+  captive handler declared `canHandle()` non-const, which overrides the archived
+  AsyncWebServer fork but not ESP32Async 3.x, where the method is const. The base
+  returned false, and since `setupCaptivePortal()` resets the server and leaves
+  that handler alone on the AP, the configuration page could not be reached at
+  all. Both overloads are now present, the same way the PR before this one had to
+  do for `isRequestHandlerTrivial()`.
+- **Irrigation: editing a field no longer rebuilds the list it lives in.** Every
+  change re-rendered the whole programs section, so the input being typed into was
+  replaced — the focus jumped and a half-entered time snapped back. Only the total
+  line and the minutes box now update in place.
+- **Irrigation: "Regar agora" no longer looks like it deletes the program.** It
+  reloaded the configuration afterwards, which threw away unsaved edits, and the
+  confirmation resized the button so the second click could land on Remover
+  beside it. Running now refuses while there are unsaved changes — the equipment
+  runs its own copy by id, so a program it has never been told about cannot run —
+  and the two buttons are no longer neighbours.
+
+### Fixed
+- Template changes on already-provisioned devices are now validated, queued for
+  the main loop, saved, and followed by a controlled restart instead of reporting
+  success while leaving the old template active. ESP32 feature readers are
+  quiesced before their vectors are replaced.
+- Captive-portal credentials are now accepted only from a non-cacheable POST
+  submission, so Wi-Fi passwords no longer appear in the request URL. Invalid
+  submissions return an error without changing the stored configuration. The
+  custom async handler now explicitly parses POST bodies; the full flow was
+  validated on ESP8266 from AP discovery through Wi-Fi reconnection.
+
+### Changed
+- Added a non-updating dependency audit runner that reports outdated PlatformIO
+  packages per configured environment, continues after target-specific failures,
+  and documents why available updates still require build and hardware validation.
+
+## [9.181] - 2026-08-19
+
+### Fixed
+- **The C6 rebooted at the end of boot, so its access point never came up.**
+  `setup()` created the features task with `xTaskCreatePinnedToCore(..., core 1)`,
+  and the C6 is single-core: FreeRTOS asserts on `xCoreID < configNUMBER_OF_CORES`
+  with assertions enabled, which panics and restarts the board. The task is now
+  pinned only where there is a second core to pin it to. The C3 never hit this
+  because its target defines `HAN_MODE`, which already took the unpinned branch —
+  the condition was the product, not the chip.
+  Anyone who installed 9.180 on a C6 should reinstall from `/flash/`.
+
+### Added
+- `ARDUINO_USB_MODE` / `ARDUINO_USB_CDC_ON_BOOT` on the C6, as the C3 already had:
+  the DevKitC-1's only port is the native USB-Serial/JTAG, so without them `Serial`
+  goes to UART0 pins and the board cannot explain itself over the port it is
+  plugged in by.
+- `ESP32C6_IRRIGATION_DEBUG`: the same image with the logs left in. The release env
+  unflags `DEBUG_ONOFRE`, which is right for a product and useless for bringing a
+  new board up.
+
+## [9.180] - 2026-08-19
+
+### Added
+- **The irrigation controller is a released variant.** The ESP32-C6 build is in
+  the release matrix, published as `ESP32-C6` and offered on `/flash/` as *OnOfre
+  Rega*. The full-flash image comes from the build's own merged `.factory.bin`,
+  which already puts the bootloader at 0x0 — where a C6 expects it, not 0x1000.
+
+### Fixed
+- **A C6 would have been offered an ESP32 image.** It reported `mcu: "ESP32"` and
+  asked the generic update URL, because the C6 build also defines `ESP32`. Both are
+  now variant-aware: it reports `ESP32-C6` and asks for that variant. Nothing was
+  at risk in the field — no C6 had ever been published — but the first one to
+  auto-update would have flashed firmware for another chip.
+
+### Removed
+- **Maker support**, as agreed. The 4 MB pin map and the `ESP32-MAKER-4MB` variant
+  are gone from the firmware, and the cloud no longer accepts that variant: any
+  device still reporting it stops being offered updates rather than receiving a
+  wrong image.
+
+### Notes
+- Still not validated on hardware. Nothing has run a real irrigation cycle, and
+  *OnOfre Rega* on `/flash/` now makes an unvalidated image installable — worth
+  keeping to the test group until a board has watered something.
+
+### Build
+- The web panel minifiers are pinned project dependencies (`package.json` +
+  `package-lock.json`, both now tracked — they were in `.gitignore`, which is why
+  they only ever existed as global installs) instead of `npm install -g`, and
+  `tools/html_converter.py` resolves them from `node_modules/.bin` before falling
+  back to `PATH`. Their exact output is embedded in the firmware image, so the
+  build must not depend on whatever version a machine happens to have; `npm ci`
+  from an empty tree reproduces the generated headers byte for byte. Install with
+  `npm ci`; a missing tool now says so and names the command. CI uses `npm ci`
+  with the npm cache instead of a global install.
+- Replaced `html-minifier` with the maintained fork `html-minifier-terser`. The
+  original is unmaintained and carries a ReDoS advisory with no fix available,
+  which is not something to pin permanently. It takes the same arguments and
+  produces byte-identical output for this panel, so the embedded assets match the
+  ones already published in 9.179; the old name is still accepted so an existing
+  global install keeps working.
+
+### Fixed
+- Documented the reproducible ESP32-C6 build failure: the first C6 run after an
+  ESP32 build dies in `arduino.py` with `Path(None)` because both platforms
+  install as `espressif32` and share one directory, leaving the framework package
+  unresolved until the failed run relinks it. Run it again, or isolate the tree
+  with `PLATFORMIO_CORE_DIR`. It was previously noted as intermittent and
+  uncharacterised.
+
+## [9.179] - 2026-08-19
+
+### Added
+- **Irrigation runs on the board.** Up to eight programs, each with a start time,
+  the weekdays it runs on, and the minutes to give each zone. The schedule lives
+  in the equipment, not in the cloud: watering has to keep working when the
+  internet is down, and a cycle half-run because MQTT dropped would leave one
+  zone soaked and the rest dry. New in the panel as the REGA tab, which only
+  appears on a board that actually has valves.
+- **Endpoints:** `POST /irrigation` replaces the schedule (and answers with what
+  the device kept, including zones it dropped), `POST /irrigation/run` forces a
+  program now, `/irrigation/stop` closes the open zone — on GET as well as POST,
+  because stopping the water is the one thing someone may need to do from a phone
+  browser bar with a wet lawn and no app. `/config` carries the whole schedule
+  plus what is running, so the panel gets it in one read.
+
+### Rules the feature rests on
+- Nothing is watered without a synced clock. A scheduler guessing the hour is
+  worse than one that refuses to run, and the panel says so instead of looking
+  broken.
+- A cycle interrupted by a power cut is not resumed on the next boot. Coming back
+  at three in the morning to finish a cycle nobody is watching is worse than
+  skipping it.
+- Rain is evaluated when the cycle starts, not per zone, so a shower halfway
+  through does not leave half the garden watered.
+- Closing the running valve — wall button, app, cloud, panel — ends the cycle
+  rather than reopening the valve under the person who just closed it.
+- A valve opened by a program answers to the program's timer, not to its own
+  autoOff: the default 30 minutes would otherwise cut a longer zone short.
+- Forcing a program by hand ignores its days, its on/off switch, the rain sensor
+  and the clock. It is an explicit act.
+
+### Notes
+- Programs are stored in their own file, `/irrigation.json`. An update can never
+  lose a working configuration because of a key it did not recognise, and a device
+  coming from 9.178 simply starts with no programs.
+- A program due while another is still running is skipped for that day rather than
+  queued; two cycles cannot share the water anyway.
+- Not yet validated on hardware: the ESP32-C6 irrigation build compiles and the
+  API was exercised against the simulator, but no board has run a real cycle.
+
+## [9.178] - 2026-08-19
+
+### Added
+- **The device has a clock.** NTP_SERVER and TZ_INFO had been in the build for a
+  long time but were never applied — nothing called configTime(), so the only
+  real timestamps came from a HAN meter's own clock over Modbus. It syncs when the
+  network comes up, and reports whether it has the time at all: `/config` carries
+  `clockSynced` and `clockNow`, and Diagnostics shows them, because a schedule
+  that refuses to run must be able to say why.
+- **Only one irrigation zone opens at a time.** The supply pressure will not feed
+  two. The guard sits in `Actuator::changeState`, which every path goes through —
+  wall button, MQTT, cloud, web panel — so it cannot be bypassed; anywhere else it
+  would be advice rather than a rule.
+
+### Notes
+- Groundwork for schedules that run on the board rather than in the cloud, so a
+  watering cycle survives an internet outage. The program model and the state
+  machine that walks the zones come next; the cards come after those.
+- Settled while designing: no watering without a synced clock, no resuming a
+  cycle after a reboot, and rain is evaluated when a program starts rather than
+  mid-cycle.
+- Not yet exercised on hardware. This is logic that drives relays connected to
+  water, so a bench test — five LEDs on the valve pins — should come before it
+  reaches a real installation.
+## [9.177] - 2026-08-19
+
+### Added
+- **An irrigation build for the ESP32-C6 (DevKitC-1).** The C6 exists only in
+  Arduino 3.x / IDF 5.x, so it runs on its own platform and leaves the fleet's
+  environments untouched. Wiring mirrors the ESPHome unit it replaces — valves on
+  GPIO 4/5/2/10/11, buttons on 18-22, rain sensor on 3 — so a board can be
+  reflashed without being rewired. The model topped out at four valves, so a
+  fifth valve, three more inputs and a rain-sensor pin were added, and the
+  irrigation template now builds five zones each bound to its own button.
+  Per-zone watering time needed no new code: an actuator's autoOff already
+  expires a running output and restarts on each turn-on.
+- **Panel: reworked function editor and status layout**, per-function cards with
+  count and category, and clearer system sections (#119).
+- **Tools: `check_project.py`** for repeatable source and build checks (#121),
+  and **`export_firmware.py`** to preserve and promote locally built binaries
+  (#120).
+
+### Fixed
+- **Cover open/closed was inverted in the device panel.** The firmware counts how
+  CLOSED a shutter is (OFF_OPEN=0, ON_CLOSE=100), but the panel printed that
+  straight as "% aberto" and filled the slider with it, while the command path
+  inverted — so a closed cover read "100% aberto" and what you saw was not what
+  you set. The panel now converts once, in both directions.
+- **Artefact names no longer break esptool 5.x.** Builds were named
+  "Firmware_env_version - date"; esptool 5.x parses its CLI with click and reads
+  the lone dash as an option, failing with "Path '-' does not exist". This would
+  have broken any platform upgrade, not just the C6.
+
+### Notes
+- The C6 environment must be built on its own: PlatformIO cannot hold two
+  packages named "espressif32" in one process, so pairing it with an ESP32
+  environment fails inside the platform builder. CI is unaffected — one
+  environment per job.
+- C6 images are not published for OTA yet: the cloud's hardware allowlist and
+  the web-flasher chip family still have to learn the new variant.
+
+## [9.176] - 2026-08-17
+
+### Added
+- **The firmware section lists every published build for the board and links each
+  one for download.** Getting the right `.bin` meant knowing the device's variant
+  and hand-building a URL, and handing someone the wrong variant is the one
+  mistake here that costs a USB recovery — so the list is filtered to the board's
+  own MCU, newest first, with the running version marked. It reads the release
+  server's existing `all-versions` and `download` routes; no backend change.
+
+## [9.175] - 2026-08-17
+
+### Fixed
+- **`/auto-update` accepts GET**, like `/reboot`, `/load-defaults` and
+  `/templates/change` already did. It was the only one registered for POST
+  alone, so pasting it into a browser answered 404 — which is exactly what
+  someone does when talking a user through an update remotely.
+
+## [9.174] - 2026-08-17
+
+### Fixed
+- **A remote UPDATE command was often swallowed.** `isAutoUpdateRequested()`
+  cleared the flag as it answered, and `loop()` called it twice per iteration:
+  once through `checkInternalRoutines()`, which performs the update, and again as
+  a guard deciding whether to skip normal work. When the MQTT command arrived
+  after the first call — `loopWiFi()` yields in between, so the async callback
+  lands there routinely — the guard consumed the request and the update never
+  ran. Pressing the button appeared to do nothing at all. Asking is now
+  non-destructive and only the code that performs the update takes the request.
+
+## [9.173] - 2026-08-15
+
+### Changed
+- **Sensor cards are measured in accessory tiles.** The sensor grid now shares the
+  tiles' column basis, so a card can be sized in whole tiles: a reading with
+  units — temperature, humidity, light, distance — and a meter take three, while
+  a door, window, motion or rain sensor is one word and keeps one.
+
+### Fixed
+- **Accessory tiles all share one height.** A name that wrapped to two lines or a
+  cover's slider made its tile taller than its neighbours, leaving the grid
+  ragged. Rows stretch to match and the pin line is anchored to the bottom edge,
+  so every tile lines up regardless of what it holds.
+
+## [9.172] - 2026-08-15
+
+### Changed
+- **Accessories are tiles, not full-width rows.** A switch is a small thing and
+  a row per accessory wasted most of the screen; a grid shows a whole
+  installation at once, with an icon per type, its state in words, and a green
+  tint when on. Each tile carries a cog that jumps straight to that feature's
+  settings, highlighted on arrival, instead of hunting a long list.
+- **The meter card shows contracted power beside each period's reading**, the
+  way the meter's own panel presents them — the pair only means something read
+  together. The tariff being billed keeps its traffic light.
+
+## [9.171] - 2026-08-15
+
+### Changed
+- **The meter card was rebuilt around what a meter actually reads.** Import,
+  meter health and export now lead as three figures side by side, the tariff
+  periods carry a traffic light so the one being billed is findable at a glance,
+  and the raw instantaneous values follow. It was a flat key/value list before,
+  which buried exactly the numbers people open the panel for. A meter card is
+  also given two columns: readings carry units and were wrapping mid-value.
+
+### Fixed
+- **Binary sensors say what they mean.** A door read "ativo" instead of open or
+  closed, and motion and rain showed nothing at all because their payloads were
+  never handled. Each driver now gets its own words, matching the values the
+  firmware publishes.
+- **Cloud status distinguishes three states** — no credentials (never adopted),
+  adopted but disconnected, and connected. It previously reported only whether
+  credentials existed, so "não configurada" on a working device sent people
+  looking for a problem that was not there.
+
+## [9.170] - 2026-08-15
+
+### Added
+- **Climate sensors now have compact live history graphs in Overview.**
+  DS18B20, DHT11/21/22, and SHT4x readings keep a bounded browser-only history
+  with separate temperature and humidity scales, min/max or stable-state
+  context, sample timestamps, and a visible newest-reading marker. History
+  resets when the page is reloaded and never writes samples to device flash.
+
+## [9.169] - 2026-08-15
+
+### Added
+- **The panel announces an available update and offers it in one click**, naming
+  the version, as the old panel did. The device only knows its own version, so
+  the panel asks the release server; without this nobody discovers that a fix
+  exists. Versions are compared component by component as numbers — string
+  comparison ranks 9.99 above 9.100.
+
+### Fixed
+- **HAN demand-control values reach Home Assistant again.** The meter's registers
+  are read as a chain of nine guarded steps, and 9.163 re-enabled `setError()` on
+  a failed read to stop a silent meter from resetting the device. That also meant
+  a single failed register aborted every later step, so `demandControlT1..T3` —
+  the eighth read — silently vanished from the payload and the Home Assistant
+  templates found nothing. A miss now costs only its own field; two misses in a
+  row still end the pass and pause polling, which is what protects the device.
+
+### Changed
+- **Binary actuators can now be controlled from their complete Overview row.**
+  The row is a keyboard-accessible pressed button instead of limiting control
+  to the small switch graphic, with a green left accent when on and a neutral
+  accent when off.
+- **The firmware version is visible again in the persistent header.** Device
+  name, chip ID, board type, and the running firmware version now stay together
+  so the installed build can be identified without opening Diagnostics.
+
+### Fixed
+- **Unsaved feature edits now survive Diagnostics refreshes.** The periodic
+  diagnostics update no longer replaces locally edited feature data with the
+  last configuration stored on the device.
+- **Live feature events stay attached after configuration changes.** Event
+  listeners are removed and rebound to the current features after loading,
+  adding, or saving configuration, so new names and features update without a
+  browser reload.
+
+## [9.168] - 2026-08-15
+
+### Fixed
+- **Saving worked again.** Moving the save button into the header left it
+  disabled with nothing to enable it, so pressing it did nothing at all — a
+  changed device or feature name was simply lost. markDirty()/clearDirty() now
+  drive the button, and it reports progress on itself instead of writing to a
+  status element that the same change had deleted; that write sat outside the
+  try block, so it threw before the request was ever sent and left the button
+  stuck disabled with no way to retry.
+
+## [9.167] - 2026-08-15
+
+### Added
+- **A PZEM v3's accumulated energy can be reset from the panel**, so the counter
+  no longer needs the button on the meter itself. `POST /sensors/reset-energy
+  {id}` queues the request rather than performing it: the meter sits on a serial
+  bus the sensor's loop owns, and reaching for it from the web handler's context
+  would corrupt a reading in flight. The reset runs on the next poll and the
+  counter reads zero from that reading onwards.
+
+  Only PZEM v3 offers the command, so the endpoint is gated and the panel draws
+  the button only on those cards. The HAN is the utility's meter and has no such
+  command — asking for one returns 404.
+
+## [9.166] - 2026-08-15
+
+### Added
+- **Light and dark themes**, remembered per browser. The panel was dark-only,
+  which is unreadable on a phone in daylight next to a distribution board. It
+  follows the system preference until told otherwise, and the choice is applied
+  before the first paint so the page never flashes the wrong theme. It lives in
+  the browser rather than device config: it belongs to whoever is looking, and
+  storing it on the device would burn flash for a preference the next browser
+  would not share.
+
+### Fixed
+- **Manual firmware upload is back.** The rebuilt panel dropped the file upload
+  to `POST /update`, which is the recovery path when the cloud cannot be
+  reached — the situation the on-device panel exists for. It returns with
+  upload progress, the device's own variant named in the warning, and a
+  magic-byte check: both ESP8266 and ESP32 images start with `0xE9`, and
+  refusing anything else saves a USB recovery after an accidental pick.
+- **Configuration restore is back**, alongside export. The exported file again
+  carries `backup: true`, which is what makes `POST /config` rebuild features
+  instead of editing them — without it an exported file did not restore
+  properly. A restore is refused if the file belongs to a different chip.
+- **Input mode is editable again** (momentary button vs latching switch). The
+  firmware derives an actuator's driver from it on every save, so it decides
+  how a wall switch behaves on identical wiring.
+
+### Build
+- **The embedded panel is always regenerated.** `run_html_converter` hung off a
+  PreAction on `$PROGPATH`, which only fires when a link happens. Changing
+  `webpanel/` alone left nothing to recompile, so the link was skipped, the
+  converter never ran, and the build reported success while embedding the
+  previous panel. CI was never affected — a fresh checkout always relinks — but
+  a local build could quietly produce firmware whose panel did not match source.
+
+## [9.165] - 2026-08-15
+
+### Added
+- **The on-device web panel was rebuilt.** It is what people reach for when the
+  cloud is unreachable, which is exactly when it mattered least before. Five
+  tabs — overview, pinout, features, diagnostics, system. The pinout is drawn
+  from the board's own pin list, so it never offers a GPIO the firmware would
+  refuse, and it names the feature holding each one.
+- **Energy meters get a card of their own.** A HAN publishes around twenty
+  fields and the panel showed only instantaneous power, dropping voltage,
+  tariff and the export reading. Exporting to the grid now reads negative and
+  green, matching the cloud panel.
+- **Feature wiring is editable.** `ConfigOnofre::update()` re-maps a pin only
+  when it is valid for the board and owned by no other feature, and parks the
+  pins a feature gives up so no relay stays latched on a GPIO nothing drives.
+- **Diagnostics on the local API** — free heap, fragmentation, largest free
+  block, uptime, reset reason, sketch size and the board's usable pins.
+
+### Fixed
+- **Creating a feature on a pin already in use is refused.** `prepareNewFeature`
+  checked only that a pin exists on the board, never that it was free, so a
+  second feature could be created on top of the first and both drivers ended up
+  on one GPIO. Sensors skipped validation entirely — a bogus pin was accepted
+  and surfaced only as a driver that never read anything. Both paths validate
+  now and return the new code 5 for a pin already in use.
+- **Destructive buttons no longer depend on `confirm()`**, which sandboxed
+  frames block silently — the template buttons looked dead — and which is easy
+  to misfire on a phone. They ask for a second click on the button itself.
+
+### Notes
+- Pin arrays stay optional on `POST /config`: a payload without them leaves the
+  wiring untouched, so v9 panels, the mobile apps and restored backups behave
+  exactly as before. Updates remain non-destructive to stored configuration.
+
+## [9.164] - 2026-08-15
+
+### Fixed
+- **MQTT callbacks no longer read past a payload or reboot on a failed allocation.**
+  The CloudIO handler built a variable-length array on an async callback's stack
+  from the broker-supplied length (up to MQTT_MAX_PACKET_SIZE) and filled it with
+  `strlcpy`, which walks the source looking for a terminator a raw payload need not
+  have. It now uses a fixed buffer and copies exactly the bytes received; payloads
+  split across packets are ignored rather than acted on as fragments. The local
+  broker handler wrote into whatever `malloc` returned — on a fragmented heap that
+  is null, and the device rebooted instead of dropping one message.
+- **Sensor polling no longer outranks the network stack on ESP32.** The task asked
+  for priority 100; FreeRTOS clamps that to the top of the range, which placed it
+  above the WiFi and TCP/IP tasks. It now runs at 2, below them.
+
+### Build
+- Registry dependencies are pinned to the versions in use (ArduinoJson 7.4.3,
+  PubSubClient 2.8, AsyncMqttClient 0.9.0, DallasTemperature 4.0.6, PZEM004T 1.1.5).
+  Twelve of eighteen dependencies previously floated, which is how a renamed header
+  in an unpinned SHT4x broke every Linux build. The remaining git URLs still track
+  their default branch.
+
+## [9.163] - 2026-08-15
+
+### Fixed
+- **A silent HAN meter no longer resets the device.** Three defects on the meter
+  read path combined into a reboot loop whenever a meter stopped answering,
+  which matches the MQTT reconnect flapping seen on HAN units:
+  - the clock read filled a six-word array with an `i <= available()` loop,
+    writing one element past the end and corrupting the stack
+    (`std::array::operator[]` does not bounds-check, so it failed silently);
+  - `setError()` was commented out in the first read's error branch, so a meter
+    that stopped answering was polled another seven times instead of once, each
+    blocking for the full 2 s Modbus timeout;
+  - that timeout was a tight spin with no yield, holding the CPU outright — past
+    the ESP8266 software watchdog at ~3.2 s, resetting the device and dropping
+    its MQTT session.
+
+## [9.162] - 2026-08-15
+
+### Changed
+- Web panel API: state-changing routes (`/reboot`, `/load-defaults`,
+  `/templates/change`) moved from `GET` to `POST`, with temporary `GET`
+  compatibility kept for older clients (#100).
+- Web panel now calls its own origin instead of a hardcoded API base URL, so it
+  works on whatever address the device is reached at (#93).
+- CloudIO config sync: per-attempt timeouts and HTTPS retries with backoff before
+  the one-time plain-HTTP fallback, which is still in place for devices whose TLS
+  handshake fails (#105).
+- Firmware build date exposed in the config/system API payload (#104).
+- `WEB_SECURE_ON` enforced on the remaining release profiles, so the on-device web
+  panel always requires its credentials (#99).
+
+### Fixed
+- Cleared config/sensor compiler warnings: deprecated ArduinoJson `containsKey()`
+  replaced with `isNull()` guards, and explicit no-op cases added for ESP32-only
+  drivers on ESP8266 (#94).
+
+### Build
+- Release builds also produce full-flash images for the browser installer at
+  `/flash/` (ESP8266 as-is, ESP32 merged with bootloader/partitions/boot_app0).
+- Cross-platform build tooling: the HTML converter and release validator are now
+  Python, so builds no longer depend on a bash/macOS-specific toolchain (#108).
+
+### Notes
+- Serial-console improvements (boot banner, reset reason, cleaner logs) ship in
+  #107 but are compiled out of release builds, which unflag `DEBUG_ONOFRE`.
+
+## [9.161] - 2026-08-14
+
+### Fixed
+- **CloudIO watchdog no longer stops permanently on HTTP 204.** When the
+  `/devices/config` sync returned 204 (device not adopted — or a transient
+  server-side condition such as a deploy or database pressure), the firmware
+  called `stopCloudIOWatchdog()` and never retried the cloud connection again:
+  the device stayed connected to the local broker (Home Assistant kept working)
+  but disappeared from CloudIO until a manual power cycle or a WiFi drop.
+  Affected mainly HAN/PZEM energy meters, whose frequent MQTT reconnects made
+  them far more likely to hit a bad window. The watchdog now backs off for
+  ~30 minutes after a 204 and then asks again, forever. A successful sync
+  clears the backoff.
+- **Firmware only built on case-insensitive filesystems.** `src/Sensors.cpp`
+  included `<SensirionI2CSht4x.h>` while the library ships
+  `SensirionI2cSht4x.h`, so every Linux build (including CI) failed. The SHT4x
+  dependency is now pinned instead of tracking upstream HEAD.
+
+### Build
+- CI builds all four release environments and publishes them to the OTA folder.
+
+## [9.17] - 2026-02-14
+
+### Release
+- Promoted stable release from `9.17-dev`.
+- Includes CloudIO/webpanel/build-flow improvements from the 9.17 development cycle.
+- Added `## [9.17]` release section to satisfy strict release validation checks.
+- Verified all configured PlatformIO environments build successfully for the 9.17 release snapshot.
+
+## [9.17-dev] - 2026-02-12
+
+### Build and Versioning
+- Added support for local overrides via `platformio_override.ini`.
+- Added `${extra.wifi_flags}` injection so local Wi-Fi settings stay out of git.
+- Switched version define to string format: `VERSION='"${extra.version}"'`.
+- Updated firmware reporting to use `String(VERSION)` for API, mDNS, and Home Assistant metadata.
+- Improved `tools/extra_script.py` parsing for quoted `VERSION` values.
+- Kept `platformio_override.ini` ignored as a local-only file.
+- Added `tools/validate_release.sh` for pre-release metadata validation (version, changelog, release envs, OTA/config URL checks).
+- Added automatic pre-build hooks in `tools/extra_script.py`:
+  - run `tools/html_converter.sh`
+  - run `tools/validate_release.sh`
+- Added skip toggles in `platformio.ini`:
+  - `SKIP_HTML_CONVERT`
+  - `SKIP_RELEASE_VALIDATE`
+- Enforced `WEB_SECURE_ON` in production/non-debug profiles and removed debug defaults from release builds (`platformio.ini`).
+- Automated webpanel asset cache token versioning during HTML conversion using project version (`[extra] version`), removing manual hardcoded `?v=` updates.
+
+### Security
+- Stopped logging credential values in debug output (`src/CoreWiFi.cpp`, `src/ConfigOnofre.cpp`).
+- Switched state-changing API routes to `POST` (`/reboot`, `/load-defaults`, `/templates/change`) and updated webpanel calls; temporary `GET` compatibility remains for older clients.
+- Migrated CloudIO config and OTA endpoints from `http://` to `https://` in firmware constants (`include/Constants.h`).
+
+### CloudIO
+- Normalized firmware version in cloud config payload (strip `-dev` suffix for backend compatibility).
+- Updated CloudIO config request to use secure client for HTTPS and added one-time silent HTTP fallback on connection/TLS failure to prevent restart loops (`src/CloudIO.cpp`).
+- Kept serial logs clean by removing fallback/URL noise while preserving request status output (`src/CloudIO.cpp`).
+- Validated OTA update flow over HTTPS on ESP8266 (`Update Success`) with successful reconnect to CloudIO/MQTT after reboot.
+
+### Webpanel
+- Replaced `parseFloat` version compare with robust parser/comparator for `-dev` formats.
+- Removed hardcoded API base URL and switched to same-origin requests.
+
+### Code Quality
+- Replaced deprecated ArduinoJson `containsKey()` checks with `isNull()` guards in config update flow.
+- Added explicit ESP8266 no-op switch cases for ESP32-only drivers (`TMF882X`, `LD2410`) to clear switch warnings.
+
+### Process and Release
+- Added `docs/RELEASE_WORKFLOW.md` with CP/PR workflow steps.
+- Added branch naming convention for CP branches.
+- Added release checklist in repo docs.
+- Added `tools/generate_release_notes.sh` to create `RELEASE_NOTES_DRAFT.md` from git history.
+
+## Baseline - before 9.17-dev
+
+- Snapshot before the `9.17-dev` maintenance and build-flow updates. Labelled
+  `9.163` at the time, renamed here so it cannot be mistaken for the released
+  9.163 above.

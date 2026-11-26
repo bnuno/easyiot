@@ -1,0 +1,152 @@
+import datetime
+import os
+import subprocess
+import sys
+from SCons.Script import Action, DefaultEnvironment  # type: ignore
+
+env = DefaultEnvironment()
+
+
+def _parse_flags():
+    try:
+        return env.ParseFlags(env.get("BUILD_FLAGS", ""))
+    except Exception:
+        return {}
+
+
+def _has_define(name):
+    flags = _parse_flags()
+    for define in flags.get("CPPDEFINES", []):
+        if define == name:
+            return True
+        if isinstance(define, (list, tuple)) and len(define) == 2 and define[0] == name:
+            return True
+    return False
+
+
+def _subprocess_env():
+    env_copy = os.environ.copy()
+    if os.name == "nt":
+        path_parts = env_copy.get("PATH", "").split(os.pathsep)
+        extras = [
+            r"C:\Program Files\nodejs",
+            os.path.join(os.environ.get("APPDATA", ""), "npm"),
+        ]
+        for p in extras:
+            if p and os.path.isdir(p) and p not in path_parts:
+                path_parts.append(p)
+        env_copy["PATH"] = os.pathsep.join(path_parts)
+    return env_copy
+
+
+def run_html_converter(source, target, env):
+    if _has_define("SKIP_HTML_CONVERT") or _has_define("NO_WEB_UI"):
+        print("")
+        print("Skipping html_converter.py (SKIP_HTML_CONVERT or NO_WEB_UI defined)")
+        print("")
+        return 0
+
+    project_dir = env["PROJECT_DIR"]
+    print("")
+    script_path = os.path.join(project_dir, "tools", "html_converter.py")
+    print("")
+    print("Running html_converter.py ...")
+    print("")
+    print("Script path:", script_path)
+    print("")
+
+    if not os.path.exists(script_path):
+        print("html_converter.py not found!")
+        return 1
+
+    subprocess.run([sys.executable, script_path], check=True, env=_subprocess_env())
+    print("")
+    return 0
+
+
+def run_dependency_validation(source, target, env):
+    project_dir = env["PROJECT_DIR"]
+    script_path = os.path.join(project_dir, "tools", "check_dependency_pins.py")
+
+    if not os.path.exists(script_path):
+        print("check_dependency_pins.py not found!")
+        return 1
+
+    print("")
+    print("Checking immutable dependency declarations ...")
+    print("")
+    subprocess.run([sys.executable, script_path], check=True, env=_subprocess_env())
+    print("")
+    return 0
+
+
+def run_release_validation(source, target, env):
+    if _has_define("SKIP_RELEASE_VALIDATE"):
+        print("")
+        print("Skipping validate_release.py (SKIP_RELEASE_VALIDATE defined)")
+        print("")
+        return 0
+
+    project_dir = env["PROJECT_DIR"]
+    script_path = os.path.join(project_dir, "tools", "validate_release.py")
+
+    if not os.path.exists(script_path):
+        print("validate_release.py not found, skipping validation.")
+        return 0
+
+    print("")
+    print("Running validate_release.py ...")
+    print("")
+    print("Script path:", script_path)
+    print("")
+
+    cmd = [sys.executable, script_path]
+    pioenv = env.get("PIOENV", "")
+    if pioenv:
+        cmd.extend(["--env", pioenv])
+
+    # Deliberately not strict here. Strict mode refuses a CHANGELOG [Unreleased]
+    # section anywhere, and an environment merely *named* RELEASE gets built dozens
+    # of times a day during development — so tying the two together means the first
+    # pending note in the changelog stops ESP8266_RELEASE and ESP32_RELEASE from
+    # compiling at all. Cutting a release is a different event from building a
+    # release target, and it has its own gate: the documented procedure runs
+    # tools/validate_release.sh --release --fail-on-http.
+    if os.environ.get("ONOFRE_STRICT_RELEASE"):
+        cmd.extend(["--release"])
+
+    subprocess.run(cmd, check=True, env=_subprocess_env())
+    print("")
+    print("--- Pre-build checks complete ---")
+    print("")
+    return 0
+
+
+# The web panel is embedded as generated headers, so it has to be rebuilt before
+# the compiler reads them. A PreAction on $PROGPATH is not enough: when only
+# webpanel/ changed there is nothing to recompile, SCons skips the link, and the
+# action never fires — the build then reports SUCCESS while embedding the
+# previous panel. Regenerating at script-load time runs on every invocation.
+run_dependency_validation(None, None, env)
+run_html_converter(None, None, env)
+
+env.AddPreAction("$PROGPATH", Action(run_release_validation, "Pre-build: release validation"))
+
+# Firmware naming
+my_flags = _parse_flags()
+version = "unknown"
+for define in my_flags.get("CPPDEFINES", []):
+    if isinstance(define, (list, tuple)) and len(define) == 2 and define[0] == "VERSION":
+        version = define[1]
+        if isinstance(version, str):
+            version = version.strip('"')
+        break
+
+timestamp = datetime.datetime.now().strftime("%d.%m.%Y")
+print("")
+# No spaces or a bare " - " in the artefact name: esptool 5.x (used by the
+# Arduino 3.x / IDF 5.x platforms) parses its CLI with click, which reads the
+# lone dash as an option and fails with "Path '-' does not exist". The older
+# argparse-based esptool 4.x tolerated it.
+env.Replace(PROGNAME=f"Firmware_{env['PIOENV']}_{version}_{timestamp}")
+print("")

@@ -1,0 +1,879 @@
+#include "HomeAssistantMqttDiscovery.h"
+#include "Mqtt.h"
+#include "ConfigOnofre.h"
+#include "Irrigation.h"
+#include "LedStrip.h"
+extern ConfigOnofre config;
+
+bool homeAssistantOnline(String topic, String payload)
+{
+  return (topic.compareTo(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/status")) == 0 || topic.compareTo(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefixLegacy) + "/status")) == 0) && payload.compareTo(constantsMqtt::availablePayload) == 0;
+}
+void createHaSwitch(Actuator &sw)
+{
+  if (!mqttConnected() || sw.isVirtual())
+    return;
+  String objectStr = "";
+  String uniqueId = String(sw.uniqueId);
+  JsonDocument doc;
+  JsonObject object = doc.to<JsonObject>();
+  object["name"] = sw.name;
+  object["uniq_id"] = uniqueId;
+  object["cmd_t"] = sw.writeTopic;
+  JsonObject device = object["dev"].to<JsonObject>();
+  device["ids"] = "OnOfre-" + String(config.chipId);
+  device["name"] = config.nodeId;
+#ifdef ESP32
+  device["mdl"] = "V6 - " + String(config.chipId);
+#endif
+#ifdef ESP8266
+  device["mdl"] = "V5 - " + String(config.chipId);
+#endif
+  device["mf"] = "OnOfre Portugal";
+  device["sw"] = String(VERSION);
+  object["avty_t"] = config.healthTopic;
+
+  if (sw.isGarage())
+  {
+    object["stat_t"] = sw.readTopic;
+    object["pl_open"] = ActuatorState::OFF_OPEN;
+    object["pl_cls"] = ActuatorState::ON_CLOSE;
+    object["pl_stop"] = ActuatorState::STOP;
+    object["stat_open"] = ActuatorState::OFF_OPEN;
+    object["stat_clsd"] = ActuatorState::ON_CLOSE;
+    object["stat_stopped"] = ActuatorState::STOP;
+    object["dev_cla"] = "garage";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/cover/" + uniqueId + "/config").c_str(), objectStr.c_str(), false);
+  }
+  else if (sw.isCover())
+  {
+    object["pl_open"] = ActuatorState::OFF_OPEN;
+    object["pl_cls"] = ActuatorState::ON_CLOSE;
+    object["pl_stop"] = ActuatorState::STOP;
+    object["dev_cla"] = "shutter";
+    object["pos_open"] = ActuatorState::OFF_OPEN;
+    object["pos_clsd"] = ActuatorState::ON_CLOSE;
+    object["pos_t"] = sw.readTopic;
+    object["set_pos_t"] = sw.writeTopic;
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/cover/" + uniqueId + "/config").c_str(), objectStr.c_str(), false);
+  }
+  else if (sw.isLight() || sw.isSwitch())
+  {
+    object["stat_t"] = sw.readTopic;
+    object["pl_on"] = ActuatorState::ON_CLOSE;
+    object["pl_off"] = ActuatorState::OFF_OPEN;
+    String family = sw.familyToText();
+    family.toLowerCase();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/" + family + "/" + uniqueId + "/config").c_str(), objectStr.c_str(), false);
+  }
+  else if (sw.isGardenValve())
+  {
+    object["stat_t"] = sw.readTopic;
+    object["ic"] = "mdi:pipe-valve";
+    object["pl_on"] = ActuatorState::ON_CLOSE;
+    object["pl_off"] = ActuatorState::OFF_OPEN;
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/switch/" + uniqueId + "/config").c_str(), objectStr.c_str(), false);
+  }
+  doc.clear();
+}
+
+void addToHomeAssistant(Sensor &s)
+{
+  String chip = String(config.chipId);
+  String objectStr = "";
+  JsonDocument doc;
+  JsonObject object = doc.to<JsonObject>();
+  object["name"] = s.name;
+  object["uniq_id"] = s.uniqueId;
+  object["stat_t"] = s.readTopic;
+  object["avty_t"] = config.healthTopic;
+  JsonObject device = object["dev"].to<JsonObject>();
+  device["ids"] = "OnOfre-" + String(config.chipId);
+  device["name"] = config.nodeId;
+#ifdef ESP32
+  device["mdl"] = "V6 - " + String(config.chipId);
+#endif
+#ifdef ESP8266
+  device["mdl"] = "V5 - " + String(config.chipId);
+#endif
+  device["mf"] = "OnOfre Portugal";
+  device["sw"] = String(VERSION);
+  String uniqueId = String(s.uniqueId);
+  switch (s.driver)
+  {
+  case DHT_11:
+  case DHT_21:
+  case DHT_22:
+  case SHT4X:
+    object["uniq_id"] = "temperature" + uniqueId;
+    object["unit_of_meas"] = "°C";
+    object["dev_cla"] = "temperature";
+    object["val_tpl"] = "{{value_json.temperature | round(2)}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    objectStr = "";
+    object["uniq_id"] = "humidity" + uniqueId;
+    object["unit_of_meas"] = "%";
+    object["dev_cla"] = "humidity";
+    object["val_tpl"] = "{{value_json.humidity | round(2) }}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    break;
+  case LDC1612:
+    // Two entities. The total carries device_class water and state_class
+    // total_increasing, which is exactly what Home Assistant's water dashboard
+    // looks for — with those two it appears there on its own, with daily and
+    // monthly consumption, and no template or helper to write.
+    object["uniq_id"] = "water" + uniqueId;
+    object["name"] = String(s.name) + " total";
+    object["unit_of_meas"] = "L";
+    object["dev_cla"] = "water";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{ value_json.liters | round(0) }}";
+    object["ic"] = "mdi:water";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    objectStr = "";
+    object["uniq_id"] = "waterflow" + uniqueId;
+    object["name"] = String(s.name) + " caudal";
+    object["unit_of_meas"] = "L/min";
+    object["dev_cla"] = "volume_flow_rate";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{ value_json.flow | round(1) }}";
+    object["ic"] = "mdi:water-pump";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case LTR303X:
+    object["uniq_id"] = uniqueId;
+    object["unit_of_meas"] = "lx";
+    object["dev_cla"] = "illuminance";
+    object["val_tpl"] = "{{value_json.lux  | round(2) }}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case HCSR04:
+    object["uniq_id"] = uniqueId;
+    object["unit_of_meas"] = "cm";
+    object["dev_cla"] = "distance";
+    object["val_tpl"] = "{{value_json.distance}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case TOFSENSE:
+    // Two entities. The distance is the measurement; the signal strength is
+    // what says whether to believe it, and without it a reading taken off a
+    // dark or angled surface looks exactly like a good one.
+    object["uniq_id"] = uniqueId;
+    object["unit_of_meas"] = "cm";
+    object["dev_cla"] = "distance";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.distance | round(1) }}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    objectStr = "";
+    object["uniq_id"] = "strength" + uniqueId;
+    object["name"] = String(s.name) + " sinal";
+    object.remove("unit_of_meas");
+    object.remove("dev_cla");
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{ value_json.strength }}";
+    object["ic"] = "mdi:signal";
+    object["ent_cat"] = "diagnostic";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case TMF882X:
+    object["uniq_id"] = uniqueId;
+    object["unit_of_meas"] = "mm";
+    object["dev_cla"] = "level";
+    object["val_tpl"] = "{{value_json.distance}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case LD2410:
+    object["name"] = "Movimento";
+    object["uniq_id"] = uniqueId + "motion";
+    object["dev_cla"] = "motion";
+    object["pl_on"] = Payloads::motionOnPayload;
+    object["pl_off"] = Payloads::motionOffPayload;
+    object["val_tpl"] = "{{value_json.motion}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+    object["name"] = "Presença";
+    object["uniq_id"] = uniqueId + "occupancy";
+    object["dev_cla"] = "occupancy";
+    object["pl_on"] = Payloads::motionOnPayload;
+    object["pl_off"] = Payloads::motionOffPayload;
+    object["val_tpl"] = "{{value_json.occupancy}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+
+    object["name"] = "Distancia alvo parado";
+    object["uniq_id"] = uniqueId + "stationaryTargetDistance";
+    object["unit_of_meas"] = "cm";
+    object["dev_cla"] = "distance";
+    object["val_tpl"] = "{{value_json.stationaryTargetDistance}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+
+    object["name"] = "Energia alvo parado";
+    object["uniq_id"] = uniqueId + "stationaryTargetEnergy";
+    object["unit_of_meas"] = "%";
+    object["dev_cla"] = "power_factor";
+    object["val_tpl"] = "{{value_json.stationaryTargetEnergy}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+
+    object["name"] = "Energia alvo em movimento";
+    object["uniq_id"] = uniqueId + "movingTargetEnergy";
+    object["unit_of_meas"] = "%";
+    object["dev_cla"] = "power_factor";
+    object["val_tpl"] = "{{value_json.movingTargetEnergy}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+
+    object["name"] = "Distancia alvo em movimento";
+    object["uniq_id"] = uniqueId + "movingTargetDistance";
+    object["unit_of_meas"] = "cm";
+    object["dev_cla"] = "distance";
+    object["val_tpl"] = "{{value_json.movingTargetDistance}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+    break;
+  case LD2420:
+    object["name"] = "Movimento";
+    object["uniq_id"] = uniqueId + "motion";
+    object["dev_cla"] = "motion";
+    object["pl_on"] = Payloads::motionOnPayload;
+    object["pl_off"] = Payloads::motionOffPayload;
+    object["val_tpl"] = "{{value_json.motion}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+
+    object["name"] = "Presença";
+    object["uniq_id"] = uniqueId + "occupancy";
+    object["dev_cla"] = "occupancy";
+    object["pl_on"] = Payloads::presenceOnPayload;
+    object["pl_off"] = Payloads::presenceOffPayload;
+    object["val_tpl"] = "{{value_json.occupancy}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+
+    object["name"] = "Distancia alvo";
+    object["uniq_id"] = uniqueId + "distance";
+    object["unit_of_meas"] = "cm";
+    object["dev_cla"] = "distance";
+    object["val_tpl"] = "{{value_json.distance}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    delay(1);
+    break;
+  case RAIN:
+    object["uniq_id"] = uniqueId;
+    object["ic"] = "mdi:weather-pouring";
+    object["val_tpl"] = "{{value_json.rain}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case PIR:
+    object["uniq_id"] = uniqueId;
+    object["dev_cla"] = "motion";
+    object["pl_on"] = Payloads::motionOnPayload;
+    object["pl_off"] = Payloads::motionOffPayload;
+    object["val_tpl"] = "{{value_json.motion}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case DOOR:
+    object["uniq_id"] = uniqueId;
+    object["dev_cla"] = "door";
+    object["pl_on"] = Payloads::windowDoornOnPayload;
+    object["pl_off"] = Payloads::windowDoornOffPayload;
+    object["val_tpl"] = "{{value_json.state}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case WINDOW:
+    object["uniq_id"] = uniqueId;
+    object["dev_cla"] = "window";
+    object["pl_on"] = Payloads::windowDoornOnPayload;
+    object["pl_off"] = Payloads::windowDoornOffPayload;
+    object["val_tpl"] = "{{value_json.state}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/binary_sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case DS18B20:
+    object["uniq_id"] = uniqueId;
+    object["unit_of_meas"] = "°C";
+    object["dev_cla"] = "temperature";
+    object["val_tpl"] = "{{value_json.temperature | round(2)}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case PZEM_004T_V03:
+    object["name"] = String(s.name) + " Power";
+    object["uniq_id"] = "p" + uniqueId;
+    object["unit_of_meas"] = "W";
+    object["dev_cla"] = "power";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.power | round(2)}}";
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = String(s.name) + " Current";
+    object["uniq_id"] = "c" + uniqueId;
+    object["unit_of_meas"] = "A";
+    object["stat_cla"] = "measurement";
+    object["dev_cla"] = "current";
+    object["val_tpl"] = "{{value_json.current | round(2)}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = String(s.name) + " Voltage";
+    object["uniq_id"] = "v" + uniqueId;
+    object["unit_of_meas"] = "V";
+    object["dev_cla"] = "voltage";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.voltage | round(2)}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = String(s.name) + " Power Factor";
+    object.remove("unit_of_meas");
+    object["dev_cla"] = "power_factor";
+    object["stat_cla"] = "measurement";
+    object["uniq_id"] = "pf" + uniqueId;
+    object["val_tpl"] = "{{value_json.powerFactor | round(2)}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = String(s.name) + " Frequency";
+    object["uniq_id"] = "f" + uniqueId;
+    object["unit_of_meas"] = "Hz";
+    object["dev_cla"] = "frequency";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.frequency}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = String(s.name) + " Energy";
+    object["uniq_id"] = "e" + uniqueId;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{value_json.energy | round(2)}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  case HAN:
+    object["name"] = "Temperature";
+    object["uniq_id"] = "temperature" + chip;
+    object["unit_of_meas"] = "°C";
+    object["dev_cla"] = "temperature";
+    object["val_tpl"] = "{{value_json.temperature | round(2)}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Humidity";
+    object["uniq_id"] = "humidity" + chip;
+    object["unit_of_meas"] = "%";
+    object["dev_cla"] = "humidity";
+    object["val_tpl"] = "{{value_json.humidity | round(2) }}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Contract";
+    object["uniq_id"] = "demandControlT1" + chip;
+    object["dev_cla"] = "power";
+    object["unit_of_meas"] = "kVA";
+    object["val_tpl"] = "{{value_json.demandControlT1}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Tarif";
+    object["uniq_id"] = "tarif" + chip;
+    object["dev_cla"] = "enum";
+    object["unit_of_meas"] = "";
+    object["val_tpl"] = "{{value_json.tarif}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object.remove("unit_of_meas");
+    object.remove("stat_cla");
+    object["name"] = "Date";
+    object["uniq_id"] = "dt" + chip;
+    object["dev_cla"] = "enum";
+    object["ic"] = "mdi:calendar";
+    object["val_tpl"] = "{{value_json.dateTime}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Date Profile";
+    object["uniq_id"] = "dtp" + chip;
+    object["dev_cla"] = "enum";
+    object["ic"] = "mdi:calendar";
+    object["val_tpl"] = "{{value_json.dateProfile}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    object.remove("ic");
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Power Import";
+    object["uniq_id"] = "power" + chip;
+    object["unit_of_meas"] = "W";
+    object["dev_cla"] = "power";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.power}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Power Export";
+    object["uniq_id"] = "export" + chip;
+    object["unit_of_meas"] = "W";
+    object["dev_cla"] = "power";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.export}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Current";
+    object["uniq_id"] = "current" + chip;
+    object["unit_of_meas"] = "A";
+    object["stat_cla"] = "measurement";
+    object["dev_cla"] = "current";
+    object["val_tpl"] = "{{value_json.current}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Voltage";
+    object["uniq_id"] = "voltage" + chip;
+    object["unit_of_meas"] = "V";
+    object["dev_cla"] = "voltage";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.voltage}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object.remove("unit_of_meas");
+    object["name"] = "Power Factor";
+    object["dev_cla"] = "power_factor";
+    object["stat_cla"] = "measurement";
+    object["uniq_id"] = "powerFactor" + chip;
+    object["val_tpl"] = "{{value_json.powerFactor}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Frequency";
+    object["uniq_id"] = "frequency" + chip;
+    object["unit_of_meas"] = "Hz";
+    object["dev_cla"] = "frequency";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.frequency}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Energy Import";
+    object["uniq_id"] = "powerImport" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{value_json.powerImport}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Energy Export";
+    object["uniq_id"] = "powerExport" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{value_json.powerExport}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Off Peak";
+    object["uniq_id"] = "rate1" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{value_json.rate1}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Peak";
+    object["uniq_id"] = "rate2" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{value_json.rate2}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Middle";
+    object["uniq_id"] = "rate3" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "total_increasing";
+    object["val_tpl"] = "{{value_json.rate3}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Active Energy Import";
+    object["uniq_id"] = "paei" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.activeEnergyImport}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Reactive Energy RC";
+    object["uniq_id"] = "prerc" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.reactiveEnergyRC}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Reactive Energy RI";
+    object["uniq_id"] = "preri" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.reactiveEnergyRI}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object["name"] = "Active Energy Export";
+    object["uniq_id"] = "paee" + chip;
+    object["unit_of_meas"] = "kWh";
+    object["dev_cla"] = "energy";
+    object["stat_cla"] = "measurement";
+    object["val_tpl"] = "{{value_json.activeEnergyExport}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+
+    object.remove("stat_cla");
+    object["name"] = "Signal";
+    object["uniq_id"] = "sg" + chip;
+    object["dev_cla"] = "signal_strength";
+    object["unit_of_meas"] = "dB";
+    object["val_tpl"] = "{{value_json.signal}}";
+    objectStr.clear();
+    serializeJson(object, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/sensor/" + (object["uniq_id"] | "") + "/config").c_str(), objectStr.c_str(), false);
+    break;
+  default:
+    break;
+  }
+  doc.clear();
+}
+void addToHomeAssistant(Actuator &sw)
+{
+  if (!mqttConnected())
+    return;
+  if (strlen(config.mqttIpDns) == 0)
+  {
+#ifdef DEBUG_ONOFRE
+    Log.warning("%s Setup required to publish discovery messages" CR, tags::mqtt);
+#endif
+    return;
+  }
+  if (strlen(config.mqttIpDns) == 0)
+  {
+#ifdef DEBUG_ONOFRE
+    Log.warning("%s Mqtt not configured" CR, tags::discovery);
+#endif
+    return;
+  }
+
+  createHaSwitch(sw);
+
+#ifdef DEBUG_ONOFRE
+  Log.notice("%s RELOAD HA SWITCH DISCOVERY OK" CR, tags::discovery);
+#endif
+}
+
+void removeFromHomeAssistant(String family, String uniqueId)
+{
+
+  if (!mqttConnected())
+    return;
+#ifdef DEBUG_ONOFRE
+  Log.notice("%s REMOVE FROM HA %s" CR, tags::discovery, uniqueId.c_str());
+#endif
+  publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/" + family + "/" + uniqueId + "/config").c_str(), "\0", false);
+}
+void initHomeAssistantDiscovery()
+{
+  if (!mqttConnected())
+    return;
+#ifdef DEBUG_ONOFRE
+  Log.notice("%s Init HomeAssistant Discovery" CR, tags::homeassistant);
+#endif
+  for (auto &sw : config.actuatores)
+  {
+    publishOnMqtt(sw.readTopic, String(sw.state).c_str(), true);
+    addToHomeAssistant(sw);
+  }
+  for (auto &ss : config.sensors)
+  {
+    // Config first, then state. The comment below is right and the old order
+    // contradicted it: an entity has to claim the topic before its state means
+    // anything.
+    addToHomeAssistant(ss);
+    // Never seed a state topic with nothing. A sensor that has not read yet has
+    // an empty state, and publishing it put an empty payload on the wire: every
+    // value template over it fails, which leaves the entity unknown and writes
+    // an error into Home Assistant's log on every reconnect. Worse, a zero-byte
+    // retained publish deletes the retained state, so a Home Assistant starting
+    // afterwards finds no value at all until the next reading.
+    if (ss.state.length() > 0)
+      publishOnMqtt(ss.readTopic, ss.state.c_str(), true);
+  }
+  // Last, and state before configs would be pointless: Home Assistant only
+  // listens to a state topic once an entity claims it.
+  createHaIrrigation();
+  publishIrrigationHomeAssistantState();
+  ledStripDiscovery();
+}
+
+namespace
+{
+  /**
+   * Lets Home Assistant compose "<device> <entity>" itself, which is what makes the
+   * entity_id predictable: binary_sensor.quadro_geral_a_regar rather than
+   * binary_sensor.a_regar, a_regar_2, a_regar_3 as soon as a second controller
+   * exists. A dashboard cannot be written against names that depend on the order
+   * devices were discovered in.
+   */
+  void haEntityNaming(JsonObject &object)
+  {
+    object["has_entity_name"] = true;
+  }
+
+  void haDevice(JsonObject &object)
+  {
+    JsonObject device = object["dev"].to<JsonObject>();
+    device["ids"] = "OnOfre-" + String(config.chipId);
+    device["name"] = config.nodeId;
+#ifdef ESP32
+    device["mdl"] = "V6 - " + String(config.chipId);
+#endif
+#ifdef ESP8266
+    device["mdl"] = "V5 - " + String(config.chipId);
+#endif
+    device["mf"] = "OnOfre Portugal";
+    device["sw"] = String(VERSION);
+  }
+
+  String zoneClockAvailabilityTopic(const char *uniqueId)
+  {
+    return String("onofre/") + config.chipId + "/irrigation/" + uniqueId + "/clock";
+  }
+
+  void publishHaConfig(const char *domain, const String &uniqueId, JsonDocument &doc)
+  {
+    String objectStr;
+    serializeJson(doc, objectStr);
+    publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/" +
+                         domain + "/" + uniqueId + "/config")
+                      .c_str(),
+                  objectStr.c_str(), false);
+  }
+
+  bool deviceHasValves()
+  {
+    for (auto &sw : config.actuatores)
+      if (sw.isGardenValve())
+        return true;
+    return false;
+  }
+}
+
+void createHaIrrigation()
+{
+  if (!mqttConnected() || !deviceHasValves())
+    return;
+
+  const String chip = String(config.chipId);
+
+  for (auto &sw : config.actuatores)
+  {
+    if (!sw.isGardenValve())
+      continue;
+    JsonDocument doc;
+    JsonObject object = doc.to<JsonObject>();
+    const String uniqueId = String(sw.uniqueId) + "_closes";
+    object["name"] = String(sw.name) + " fecha a";
+    object["uniq_id"] = uniqueId;
+    object["stat_t"] = config.irrigationStateTopic;
+    object["val_tpl"] = String("{{ (value_json.clocks | selectattr('zone','eq','") +
+                        sw.uniqueId + "') | map(attribute='closesAt') | first | default('') }}";
+    object["dev_cla"] = "timestamp";
+    object["ic"] = "mdi:timer-sand";
+    // Two conditions, both required: the device has to be there AND the valve has
+    // to be open. A closed valve has no closing time, and inventing one — or
+    // keeping the last — would be a dashboard that lies.
+    JsonArray availability = object["avty"].to<JsonArray>();
+    JsonObject deviceAvailable = availability.add<JsonObject>();
+    deviceAvailable["t"] = config.healthTopic;
+    JsonObject clockAvailable = availability.add<JsonObject>();
+    clockAvailable["t"] = zoneClockAvailabilityTopic(sw.uniqueId);
+    object["avty_mode"] = "all";
+    haEntityNaming(object);
+    haDevice(object);
+    publishHaConfig("sensor", uniqueId, doc);
+  }
+
+  {
+    JsonDocument doc;
+    JsonObject object = doc.to<JsonObject>();
+    const String uniqueId = chip + "_irrigation_running";
+    object["name"] = "A regar";
+    object["uniq_id"] = uniqueId;
+    object["stat_t"] = config.irrigationStateTopic;
+    object["val_tpl"] = "{{ 'ON' if value_json.running else 'OFF' }}";
+    object["dev_cla"] = "running";
+    object["avty_t"] = config.healthTopic;
+    haEntityNaming(object);
+    haDevice(object);
+    publishHaConfig("binary_sensor", uniqueId, doc);
+  }
+
+  {
+    JsonDocument doc;
+    JsonObject object = doc.to<JsonObject>();
+    const String uniqueId = chip + "_irrigation_stop";
+    object["name"] = "Parar rega";
+    object["uniq_id"] = uniqueId;
+    object["cmd_t"] = config.irrigationWriteTopic;
+    object["pl_prs"] = "STOP";
+    object["ic"] = "mdi:water-off";
+    object["avty_t"] = config.healthTopic;
+    haEntityNaming(object);
+    haDevice(object);
+    publishHaConfig("button", uniqueId, doc);
+  }
+
+  {
+    JsonDocument doc;
+    JsonObject object = doc.to<JsonObject>();
+    const String uniqueId = chip + "_irrigation_max_zones";
+    object["name"] = "Setores em simultâneo";
+    object["uniq_id"] = uniqueId;
+    object["cmd_t"] = config.irrigationWriteTopic;
+    object["cmd_tpl"] = "MAX:{{ value | int }}";
+    object["stat_t"] = config.irrigationStateTopic;
+    object["val_tpl"] = "{{ value_json.maxConcurrentZones }}";
+    object["min"] = 1;
+    object["max"] = kMaxConcurrentZones;
+    object["step"] = 1;
+    object["mode"] = "box";
+    object["ic"] = "mdi:water-pump";
+    object["ent_cat"] = "config";
+    object["avty_t"] = config.healthTopic;
+    haEntityNaming(object);
+    haDevice(object);
+    publishHaConfig("number", uniqueId, doc);
+  }
+
+  // A button per program, and an empty config for the slots that hold none: the
+  // buttons ARE the programs, so a deleted program must take its button with it
+  // rather than leave one that waters nothing.
+  for (uint8_t id = 1; id <= 8; id++)
+  {
+    const String uniqueId = chip + "_irrigation_run_" + String(id);
+    const IrrigationProgram *program = nullptr;
+    for (const auto &candidate : irrigation.programs)
+      if (candidate.id == id)
+        program = &candidate;
+
+    if (program == nullptr)
+    {
+      publishOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) +
+                           "/button/" + uniqueId + "/config")
+                        .c_str(),
+                    "", false);
+      continue;
+    }
+    JsonDocument doc;
+    JsonObject object = doc.to<JsonObject>();
+    object["name"] = "Regar programa " + String(id);
+    object["uniq_id"] = uniqueId;
+    object["cmd_t"] = config.irrigationWriteTopic;
+    object["pl_prs"] = "RUN:" + String(id);
+    object["ic"] = "mdi:sprinkler-variant";
+    object["avty_t"] = config.healthTopic;
+    haEntityNaming(object);
+    haDevice(object);
+    publishHaConfig("button", uniqueId, doc);
+  }
+}
+
+void publishIrrigationHomeAssistantState()
+{
+  if (!mqttConnected() || !deviceHasValves())
+    return;
+  JsonDocument doc;
+  JsonVariant root = doc.to<JsonObject>();
+  irrigation.statusJson(root);
+  String payload;
+  serializeJson(doc, payload);
+  publishOnMqtt(config.irrigationStateTopic, payload.c_str(), true);
+
+  // The per-zone availability that decides whether a closing time exists at all.
+  for (auto &sw : config.actuatores)
+  {
+    if (!sw.isGardenValve())
+      continue;
+    unsigned long left = 0ul;
+    unsigned long total = 0ul;
+    const bool hasClock = sw.valveClock(left, total);
+    publishOnMqtt(zoneClockAvailabilityTopic(sw.uniqueId).c_str(),
+                  hasClock ? constantsMqtt::availablePayload : constantsMqtt::unavailablePayload,
+                  true);
+  }
+}

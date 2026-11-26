@@ -1,0 +1,363 @@
+#include "Arduino.h"
+#pragma once
+enum Template
+{
+    NO_TEMPLATE,
+    DUAL_LIGHT,
+    DUAL_SWITCH,
+    COVER,
+    GARAGE,
+    HAN_MODULE,
+    GARDEN,
+    WATER_METER,
+    TOF_DISTANCE,
+};
+namespace constantsMqtt
+{
+    constexpr const char *mqttCloudURL{"mqtt.bhonofre.pt"};
+    constexpr const char *availablePayload{"online"};
+    constexpr const char *homeAssistantAutoDiscoveryPrefixLegacy{"hass"};
+    constexpr const char *homeAssistantAutoDiscoveryPrefix{"homeassistant"};
+    constexpr const char *unavailablePayload{"offline"};
+    constexpr const int defaultPort{1883};
+} // namespace constantsMqt
+
+namespace Provision
+{
+    constexpr const char *pop = "abcd1234";
+    constexpr const char *PREFIX = "ONOFRE";
+
+}
+
+namespace Payloads
+{
+    constexpr const char *presenceOnPayload{"detected"};
+    constexpr const char *presenceOffPayload{"clear"};
+    constexpr const char *motionOnPayload{"detected"};
+    constexpr const char *motionOffPayload{"clear"};
+    constexpr const char *windowDoornOnPayload{"closed"};
+    constexpr const char *windowDoornOffPayload{"open"};
+    constexpr const char *rainOnPayload{"rain"};
+    constexpr const char *rainOffPayload{"clear"};
+}
+// namespace constantsSensor
+namespace tags
+{
+    constexpr const char *system{"[SYSTEM]"};
+    constexpr const char *build{"[BUILD]"};
+    constexpr const char *config{"[CONFIG]"};
+    constexpr const char *mqtt{"[MQTT]"};
+    constexpr const char *wifi{"[WIFI]"};
+    constexpr const char *discovery{"[DISCOVERY]"};
+    constexpr const char *sensors{"[SENSORS]"};
+    constexpr const char *actuatores{"[ACTUATORS]"};
+    constexpr const char *webserver{"[WEBSERVER]"};
+    constexpr const char *cloudIO{"[CLOUDIO]"};
+    constexpr const char *homeassistant{"[HOMEASSISTANT]"};
+
+} // namespace tags
+namespace configFilenames
+{
+    constexpr const char *config = "/config.json";
+    constexpr const char *configTemporary = "/config.tmp";
+    /* Irrigation programs live in their own file, not in config.json: an update
+       must never be able to lose a working configuration because it failed to
+       parse a key it did not know about. A device coming from v9 simply has no
+       such file and starts with no programs. */
+    constexpr const char *irrigation = "/irrigation.json";
+    constexpr const char *irrigationTemporary = "/irrigation.tmp";
+    constexpr const char *configRollback = "/config.rollback";
+    constexpr const char *irrigationRollback = "/irrigation.rollback";
+    constexpr const char *restore = "/restore.json";
+    constexpr const char *restoreTemporary = "/restore.tmp";
+}
+
+namespace constantsConfig
+{
+    constexpr unsigned long SHUTTER_DEFAULT_COURSE_TIME_SECONS{25};
+    constexpr unsigned long energyReadDelay{5000l};
+    constexpr unsigned long climateReadDelay{10000l};
+    constexpr unsigned long rainDelay{5000l};
+    constexpr unsigned long pirDelay{100l};
+    constexpr unsigned long ld2410Delay{500l};
+    constexpr unsigned long ld2420Delay{500l};
+    constexpr unsigned long hcsr04Delay{100l};
+    constexpr unsigned long hallsensorDelay{1000l};
+    constexpr unsigned long illuminanceReadDelay{5000l};
+    constexpr unsigned long storeConfigDelay{5000ul};
+    constexpr const char *apSecret{"bhonofre"}; // AP PASSWORD
+    constexpr const char *apiUser{"admin"};     // API USER
+    constexpr const char *apiPassword{"xpto"};  // API PASSWORD
+    constexpr const char *PW_HIDE{"******"};
+    constexpr unsigned long DEFAULT_TIME_SENSOR_ERROR_CLEAR{60000};
+}
+#if defined(ESP32) && !defined(ESP32C6) && !defined(ESP32C3)
+namespace DefaultPins
+{
+    // ESP32 DEFAULT PINS
+    constexpr unsigned int noGPIO{99u};
+    constexpr unsigned int INPUT_ONE{14u};
+    constexpr unsigned int INPUT_TWO{13u};
+    constexpr unsigned int OUTPUT_ONE{4u};
+    constexpr unsigned int OUTPUT_TWO{5u};
+    constexpr unsigned int PZEM_TX{26u};
+    constexpr unsigned int PZEM_RX{27u};
+    constexpr int SDA{32u};
+    constexpr int SCL{33u};
+    constexpr int HAN_TX{13u};
+    constexpr int HAN_RX{14u};
+    constexpr unsigned int OUTPUT_VALVE_THREE{noGPIO};
+    constexpr unsigned int OUTPUT_VALVE_FOUR{noGPIO};
+    constexpr unsigned int outputInputPins[] = {4,5,7, 8, 12, 13, 14, 19, 20, 21, 22, 25, 26, 27};
+    constexpr unsigned int intputOnlyPins[] = {34, 35, 36, 37, 38};
+}
+#endif
+#ifdef ESP32C3
+namespace DefaultPins
+{
+    // ESP32-C3 (XIAO ESP32-C3 and similar). The chip only has GPIO 0-21, so the classic-ESP32 table above
+    // (I2C on 32/33, pins up to 27, input-only 34-38) does not exist here: Wire.begin(32, 33) at boot has
+    // nothing to attach to. Not offered as feature pins: 12-17 (SPI flash), 18/19 (USB), 8/9 (strapping;
+    // GPIO9 is the BOOT button) and 6/7 (the Smart Bus below, which Wire owns once discovery has run).
+    // XIAO pads: D0=2 D1=3 D2=4 D3=5 D4=6 D5=7 D6=21 D7=20 D8=8 D9=9 D10=10.
+    constexpr unsigned int noGPIO{99u};
+    constexpr unsigned int INPUT_ONE{3u};
+    constexpr unsigned int INPUT_TWO{10u};
+    constexpr unsigned int OUTPUT_ONE{4u};
+    constexpr unsigned int OUTPUT_TWO{5u};
+    constexpr unsigned int PZEM_TX{21u};
+    constexpr unsigned int PZEM_RX{20u};
+    constexpr int SDA{6u};
+    constexpr int SCL{7u};
+    constexpr int HAN_TX{21u};
+    constexpr int HAN_RX{20u};
+    constexpr unsigned int OUTPUT_VALVE_THREE{noGPIO};
+    constexpr unsigned int OUTPUT_VALVE_FOUR{noGPIO};
+    // RISC-V parts have no input-only pins.
+    constexpr unsigned int outputInputPins[] = {0, 1, 2, 3, 4, 5, 10, 20, 21};
+}
+#endif
+#ifdef ESP32C6
+// Seeed XIAO ESP32-C6: an RF switch picks between the ceramic antenna and the
+// U.FL connector. GPIO3 low powers the switch; GPIO14 then selects the
+// antenna (low = on-board, high = external). These builds target the
+// DevKitC-1, so the XIAO variant's own initVariant() never runs and nothing
+// drives the switch unless the configuration asks for it.
+namespace XiaoC6Antenna
+{
+    constexpr unsigned int RF_SWITCH_ENABLE{3u};
+    constexpr unsigned int ANTENNA_SELECT{14u};
+}
+namespace DefaultPins
+{
+    // ESP32-C6-DevKitC-1, wired for irrigation: five valves, one button each and
+    // a rain sensor. Pins mirror the board that already runs this job, so a unit
+    // can be reflashed from the ESPHome build without rewiring.
+    //   valves  GPIO 4, 5, 2, 10, 11
+    //   buttons GPIO 18, 19, 20, 21, 22   (input, pull-up, active low)
+    //   rain    GPIO 3                    (input, pull-up, active low)
+    // Reserved on this module: 12/13 (USB-JTAG), 16/17 (UART0), 24-30 (flash),
+    // 8/9/15 (strapping). RISC-V parts have no input-only pins.
+    constexpr unsigned int noGPIO{999u};
+    constexpr unsigned int OUTPUT_ONE{4u};
+    constexpr unsigned int OUTPUT_TWO{5u};
+    constexpr unsigned int OUTPUT_VALVE_THREE{2u};
+    constexpr unsigned int OUTPUT_VALVE_FOUR{10u};
+    constexpr unsigned int OUTPUT_VALVE_FIVE{11u};
+    constexpr unsigned int INPUT_ONE{18u};
+    constexpr unsigned int INPUT_TWO{19u};
+    constexpr unsigned int INPUT_THREE{20u};
+    constexpr unsigned int INPUT_FOUR{21u};
+    constexpr unsigned int INPUT_FIVE{22u};
+    constexpr unsigned int RAIN_SENSOR{3u};
+    // Unused here, but referenced by ESP32-wide code paths.
+    constexpr unsigned int PZEM_TX{6u};
+    constexpr unsigned int PZEM_RX{7u};
+    // Overridable from the build. The pair below is this target's Smart Bus, and it
+    // is also the ESP32-C6's LP-I2C pair — the only one a low-power core can drive
+    // in deep sleep, which is why it is the default. But boards disagree: an M5Stack
+    // Unit C6L puts its Grove connector on GPIO5/4 and spends GPIO6 on a display's
+    // chip select, so a fixed constant makes that board unusable rather than merely
+    // inconvenient.
+#ifdef ONOFRE_I2C_SDA
+    constexpr int SDA{ONOFRE_I2C_SDA};
+#else
+    constexpr int SDA{6u};
+#endif
+#ifdef ONOFRE_I2C_SCL
+    constexpr int SCL{ONOFRE_I2C_SCL};
+#else
+    constexpr int SCL{7u};
+#endif
+    constexpr int HAN_TX{6u};
+    constexpr int HAN_RX{7u};
+    // GPIO6/7 are the fixed Smart Bus I2C pins above. Exposing either one as a
+    // configurable feature pin lets Wire take ownership after actuator setup,
+    // leaving a persisted relay mapped to a pin that is no longer GPIO output.
+    constexpr unsigned int outputInputPins[] = {0, 1, 2, 3, 4, 5, 10, 11, 18, 19, 20, 21, 22, 23};
+}
+#endif
+#ifdef ESP8266
+namespace DefaultPins
+{
+    // ESP8266 DEFAULT PINS
+    constexpr unsigned int noGPIO{999u};
+    constexpr unsigned int INPUT_ONE{12u};
+    constexpr unsigned int INPUT_TWO{13u};
+    constexpr unsigned int OUTPUT_ONE{4u};
+    constexpr unsigned int OUTPUT_TWO{5u};
+    constexpr unsigned int OUTPUT_VALVE_THREE{14u};
+    constexpr unsigned int OUTPUT_VALVE_FOUR{13u};
+    constexpr unsigned int PZEM_TX{3u};
+    constexpr unsigned int PZEM_RX{1u};
+    constexpr int SDA{2u};
+    constexpr int SCL{13u};
+    constexpr int HAN_TX{14u};
+    constexpr int HAN_RX{12u};
+    constexpr unsigned int outputInputPins[] = {0, 1, 2, 3, 4, 5, 12, 13, 14, 16};
+}
+#endif
+namespace constanstsCloudIO
+{
+    constexpr const char *mqttDns{"mqtt.bhonofre.pt"};
+    constexpr int mqttPort{1883};
+#ifdef ESP8266
+    // cloudio.bhonofre.pt negotiates RFC 6066 maximum fragment length. The
+    // BearSSL default 16 KB receive buffer cannot coexist with the running
+    // WebUI/MQTT heap on an ESP8266. Cloud sync can run during a memory-heavy
+    // startup, so it uses the smallest negotiated fragment. OTA also uses that
+    // fragment size now that v9.198's runtime state leaves less handshake heap.
+    constexpr int cloudTlsReceiveBufferSize{512};
+    constexpr int otaTlsReceiveBufferSize{512};
+    constexpr int tlsTransmitBufferSize{512};
+    // Cloud sync runs with the WebUI and other services alive. HTTPClient also
+    // allocates request/header storage after the TLS connection is established,
+    // so its gate needs substantially more reserve than the OTA path. If this
+    // reserve is unavailable, CloudIO uses its existing plain-HTTP fallback.
+    constexpr uint32_t cloudTlsMinimumFreeHeap{22000};
+    constexpr uint32_t cloudTlsMinimumMaxBlock{12000};
+    // v9.198 reproduced a BearSSL allocation failure at 12,960 bytes free with
+    // a 9,912-byte largest block. Never enter TLS near that measured cliff:
+    // close browser/MQTT transports first, then require useful reserve for both
+    // the handshake and the updater's request/header allocations.
+    constexpr uint32_t otaTlsMinimumFreeHeap{15000};
+    constexpr uint32_t otaTlsMinimumMaxBlock{11000};
+#endif
+    constexpr const char *configUrl{"https://cloudio.bhonofre.pt/devices/config"};
+    // The variant names the image this build updates from, so it has to name
+    // this build and nothing broader. The chip alone is not enough: boards of
+    // one chip differ in their pins, and a C6 water meter handed the irrigation
+    // image comes back driving valves on its I2C pins. A build env that is not
+    // simply "the generic one for its chip" sets ONOFRE_OTA_VARIANT itself; the
+    // defaults below cover the rest. The same name is reported as "mcu" to the
+    // panel and the cloud, which use it to look for updates -- so it is worked
+    // out here once, never a second time somewhere else.
+#if !defined(ONOFRE_OTA_VARIANT)
+#if defined(CONFIG_IDF_TARGET_ESP32C3) && defined(HAN_MODE)
+    // Tested before HAN_MODE alone: the C3 meter used to ask for the ESP8266
+    // meter's image.
+#define ONOFRE_OTA_VARIANT "ESP32-C3-HAN"
+#elif defined(HAN_MODE)
+#define ONOFRE_OTA_VARIANT "ESP8266-HAN"
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+    // Without a variant the cloud sees an ESP32-family board asking over the
+    // x-ESP32-version header and hands it the 8 MB ESP32 image.
+#define ONOFRE_OTA_VARIANT "ESP32-C3"
+#elif defined(ESP32C6) && defined(IRRIGATION_MODE)
+    // The irrigation controller keeps the name every C6 used to share, so the
+    // boards already in gardens go on updating from the image they run.
+#define ONOFRE_OTA_VARIANT "ESP32-C6"
+#elif defined(ESP32C6)
+#define ONOFRE_OTA_VARIANT "ESP32-C6-GENERIC"
+#endif
+#endif
+#if defined(ONOFRE_OTA_VARIANT)
+    constexpr const char *otaUrl{"https://cloudio.bhonofre.pt/firmware/update/latest?variant=" ONOFRE_OTA_VARIANT};
+#else
+    // The 8 MB ESP32 and the ESP8266: the cloud tells them apart by the
+    // x-ESP32-version / x-ESP8266-version header.
+    constexpr const char *otaUrl{"https://cloudio.bhonofre.pt/firmware/update/latest"};
+#endif
+}
+
+namespace Discovery
+{
+    constexpr int I2C_SHT4X_ADDRESS{0x44};           // TEMPERATURE/HUMIDITY
+    constexpr int I2C_LTR303_ADDRESS{0x29};          // ILLUMINANCE
+    constexpr int I2C_LDC1612_ADDRESS{0x2B};         // WATER METER (0x2A if ADDR high)
+    constexpr int I2C_SSD1306_ADDRESS{0x3C};         // DISPLAY
+    constexpr int I2C_TMF880X_ADDRESS{0x41};         // TIME OF FLY
+    constexpr int MODBUS_PZEM_ADDRESS_START{0x10};   // POWER METER
+    constexpr int MODBUS_PZEM_ADDRESS_DEFAULT{0xF8}; // POWER METER
+}
+
+namespace Family
+{
+    constexpr const char *SWITCH{"SWITCH"};
+    constexpr const char *GARDEN{"GARDEN"};
+    constexpr const char *LIGTH{"LIGHT"};
+    constexpr const char *CLIMATE{"CLIMATE"};
+    constexpr const char *SECURITY{"SECURITY"};
+    constexpr const char *ENERGY{"ENERGY"};
+    constexpr const char *LEVEL_METER{"LEVEL_METER"};
+    constexpr const char *NONE{"NONE"};
+
+}
+
+namespace I18N
+{
+    constexpr const char *SWICTH_ONE{"Interruptor1"};
+    constexpr const char *SWICTH_TWO{"Interruptor2"};
+    constexpr const char *VALVE_ONE{"Válvula 1"};
+    constexpr const char *VALVE_TWO{"Válvula 2"};
+    constexpr const char *VALVE_THREE{"Válvula 3"};
+    constexpr const char *VALVE_FOUR{"Válvula 4"};
+    constexpr const char *VALVE_FIVE{"Válvula 5"};
+    constexpr const char *RAIN_SENSOR_NAME{"Chuva"};
+    constexpr const char *GARAGE{"Garagem"};
+    constexpr const char *COVER{"Estore"};
+    constexpr const char *HAN{"Contador"};
+    constexpr const char *ENERGY{"Energia "};
+    constexpr const char *ILLUMINANCE{"Iluminação "};
+    constexpr const char *CLIMATIZATION{"Climatização"};
+    constexpr const char *WATER_METER_NAME{"Contador de água"};
+    constexpr const char *TOF_SENSOR_NAME{"Distância"};
+    constexpr const char *NO_NAME{"Sem Nome"};
+
+}
+
+namespace FeatureDrivers
+{
+    constexpr const char *SWITCH_PUSH{"SWITCH_PUSH"};
+    constexpr const char *SWITCH_LATCH{"SWITCH_LATCH"};
+    constexpr const char *COVER_DUAL_PUSH{"COVER_DUAL_PUSH"};
+    constexpr const char *COVER_SINGLE_PUSH{"COVER_SINGLE_PUSH"};
+    constexpr const char *COVER_DUAL_LATCH{"COVER_DUAL_LATCH"};
+    constexpr const char *LOCK_PUSH{"LOCK_PUSH"};
+    constexpr const char *LIGHT_PUSH{"LIGHT_PUSH"};
+    constexpr const char *LIGHT_LATCH{"LIGHT_LATCH"};
+    constexpr const char *GARAGE_PUSH{"GARAGE_PUSH"};
+    constexpr const char *LTR303{"LTR303"};
+    constexpr const char *DS18B20{"DS18B20"};
+    constexpr const char *DHT_11{"DHT_11"};
+    constexpr const char *DHT_21{"DHT_21"};
+    constexpr const char *DHT_22{"DHT_22"};
+    constexpr const char *SHT4X{"SHT4X"};
+    constexpr const char *PZEM_004T_V03{"PZEM_004T_V03"};
+    constexpr const char *PZEM_004T_V01{"PZEM_004T_V01"};
+    constexpr const char *HAN{"HAN_MODBUS"};
+    constexpr const char *HAN_8N2{"HAN_MODBUS_8N2"};
+    constexpr const char *RAIN{"RAIN"};
+    constexpr const char *DOOR{"DOOR"};
+    constexpr const char *WINDOW{"WINDOW"};
+    constexpr const char *PIR{"PIR"};
+    constexpr const char *GARDEN_VALVE{"GARDEN_VALVE"};
+    constexpr const char *HCSR04{"HCSR04"};
+    constexpr const char *LDC1612{"LDC1612"};
+    constexpr const char *LD2410{"LD2410"};
+    constexpr const char *LD2420{"LD2420"};
+    constexpr const char *TMF882X{"TMF882X"};
+    constexpr const char *TOFSENSE{"TOFSENSE"};
+
+    constexpr const char *INVALID{"INVALID"};
+}

@@ -1,0 +1,222 @@
+#include "DeviceLog.h"
+#include "Mqtt.h"
+#include "Irrigation.h"
+#include "CloudIO.h"
+#include "ConfigOnofre.h"
+#include <PubSubClient.h>
+#include "Actuatores.h"
+#include "CoreWiFi.h"
+#include "Constants.h"
+#include "HomeAssistantMqttDiscovery.h"
+#include "WebServer.h"
+#include "LedStrip.h"
+extern ConfigOnofre config;
+static WiFiClient espClient;
+static PubSubClient mqttClient(espClient);
+
+void callbackMqtt(char *topic, byte *payload, unsigned int length)
+{
+#ifdef DEBUG_ONOFRE
+    Log.notice("%s Message received" CR, tags::mqtt);
+#endif
+    // Under a fragmented heap this allocation can fail, and writing to the null it
+    // returns took the device down with it. Drop the message instead of rebooting.
+    char *payload_as_string = (char *)malloc(length + 1);
+    if (payload_as_string == nullptr)
+    {
+#ifdef DEBUG_ONOFRE
+        Log.error("%s Out of memory for a %d byte payload; message dropped" CR, tags::mqtt, length);
+#endif
+        return;
+    }
+    memcpy(payload_as_string, (char *)payload, length);
+    payload_as_string[length] = 0;
+#ifdef DEBUG_ONOFRE
+    Log.notice("%s Topic: %s" CR, tags::mqtt, topic);
+    Log.notice("%s Payload: %s" CR, tags::mqtt, payload_as_string);
+#endif
+    // PubSubClient invokes this callback synchronously from mqttClient.loop().
+    // loopMqtt() owns the non-reentrant feature/config lease for the complete
+    // client operation, so this callback must not acquire it again.
+    if (homeAssistantOnline(topic, payload_as_string))
+    {
+        initHomeAssistantDiscovery();
+    }
+    else if (strcmp(topic, config.irrigationWriteTopic) == 0)
+    {
+        // A Home Assistant button or number lands here. Republish either way: a
+        // refused payload still leaves the entities showing the truth.
+        irrigation.command(payload_as_string);
+        notifyIrrigation();
+    }
+    else if (ledStripHandleMqtt(topic, payload_as_string))
+    {
+        // consumed by the LED strip
+    }
+    else
+    {
+        const ConfigUpdateResult result =
+            config.controlFeature(StateOrigin::MQTT, topic, payload_as_string);
+        if (result == ConfigUpdateResult::PERSISTENCE_FAILED)
+            config.reportControlPersistenceFailure(StateOrigin::MQTT, topic);
+    }
+    free(payload_as_string);
+}
+
+boolean reconnect()
+{
+
+    if (!wifiConnected() || strlen(config.mqttIpDns) == 0)
+        return false;
+#ifdef DEBUG_ONOFRE
+    Log.notice("%s Trying to connect on broker %s" CR, tags::mqtt, config.mqttIpDns);
+#endif
+    sendToServerEvents("mqtt_health", constantsMqtt::unavailablePayload);
+    if (mqttClient.connect(config.chipId, String(config.mqttUsername).c_str(), String(config.mqttPassword).c_str(), config.healthTopic, 0, true, constantsMqtt::unavailablePayload, true))
+    {
+#ifdef DEBUG_ONOFRE
+        Log.notice("%s Connected to %s" CR, tags::mqtt, config.mqttIpDns);
+#endif
+        publishOnMqtt(config.healthTopic, constantsMqtt::availablePayload, true);
+        subscribeOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefix) + "/status").c_str());
+        subscribeOnMqtt(String(String(constantsMqtt::homeAssistantAutoDiscoveryPrefixLegacy) + "/status").c_str());
+        sendToServerEvents("mqtt_health", constantsMqtt::availablePayload);
+        deviceLog("mqtt ligado a %s", config.mqttIpDns);
+        // reconnect() is reached only from loopMqtt(), which already owns the
+        // lease. Keep the complete subscription scan in that same snapshot.
+        for (auto &sw : config.actuatores)
+        {
+            if (sw.isVirtual())
+            {
+                continue;
+            }
+            subscribeOnMqtt(sw.writeTopic);
+            sw.notifyState(StateOrigin::MQTT);
+        }
+        // Where the Home Assistant buttons and the zone-count number send to.
+        subscribeOnMqtt(config.irrigationWriteTopic);
+        ledStripSubscribe();
+        initHomeAssistantDiscovery();
+    }
+
+    return mqttConnected();
+}
+
+void setupMQTT(bool forceDisconnect)
+{
+
+#ifdef DEBUG_ONOFRE
+    Log.notice("%s Setup" CR, tags::mqtt);
+#endif
+    if (mqttConnected() && forceDisconnect)
+    {
+        mqttClient.disconnect();
+    }
+    if (strlen(config.mqttIpDns) == 0)
+    {
+        return;
+    }
+    mqttClient.setServer(config.mqttIpDns, config.mqttPort);
+    mqttClient.setCallback(callbackMqtt);
+}
+
+void disconnectMqttForUpdate()
+{
+    if (mqttConnected())
+    {
+        mqttClient.disconnect();
+    }
+}
+
+void loopMqtt()
+{
+    // PubSubClient is synchronous: connect(), loop(), callback dispatch, state
+    // publication, and configuration changes must never use the client or its
+    // backing config strings concurrently from another task.
+    if (!config.tryBeginFeatureAccess("mqtt"))
+        return;
+    if (!wifiConnected() || strlen(config.mqttIpDns) == 0)
+    {
+        config.endFeatureAccess();
+        return;
+    }
+    static unsigned long lastReconnectAttempt = millis();
+    if (!mqttConnected())
+    {
+        long now = millis();
+        if (now - lastReconnectAttempt > 8000)
+        {
+#ifdef DEBUG_ONOFRE
+            Log.notice("%s Disconnected" CR, tags::mqtt);
+#endif
+            lastReconnectAttempt = now;
+            if (reconnect())
+            {
+                lastReconnectAttempt = 0;
+            }
+        }
+    }
+    else
+    {
+        mqttClient.loop();
+    }
+    config.endFeatureAccess();
+}
+
+bool publishOnMqtt(const char *topic, const char *payload, bool retain)
+{
+    if (!mqttConnected())
+    {
+#ifdef DEBUG_ONOFRE
+        Log.warning("%s Connection Required" CR, tags::mqtt);
+#endif
+        return false;
+    }
+    const bool published = mqttClient.publish(topic, payload, retain);
+    if (published)
+    {
+#ifdef DEBUG_ONOFRE
+        Log.error("%s Message %s published to the topic %s successfully" CR, tags::mqtt, payload, topic);
+#endif
+    }
+#ifdef DEBUG_ONOFRE
+    else
+    {
+
+        Log.error("%s Error on try publish to the topic %s with message %s" CR, tags::mqtt, topic, payload);
+    }
+#endif
+    return published;
+}
+bool mqttConnected()
+{
+    return mqttClient.connected();
+}
+void subscribeOnMqtt(const char *topic)
+{
+    if (strlen(config.mqttIpDns) == 0)
+    {
+#ifdef DEBUG_ONOFRE
+        Log.warning("%s Setup required to subscrive messages" CR, tags::mqtt);
+#endif
+        return;
+    }
+    if (!mqttConnected())
+    {
+#ifdef DEBUG_ONOFRE
+        Log.warning("%s Required Mqtt connection" CR, tags::mqtt);
+#endif
+        return;
+    }
+    mqttClient.subscribe(topic);
+}
+void unsubscribeOnMqtt(const char *topic)
+{
+    if (mqttConnected())
+    {
+#ifdef DEBUG_ONOFRE
+        Log.notice("%s Unsubscribe on topic %s " CR, tags::mqtt, topic);
+#endif
+        mqttClient.unsubscribe(topic);
+    }
+}

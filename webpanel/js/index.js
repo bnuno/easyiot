@@ -1,0 +1,2934 @@
+let baseUrl = (location.origin && location.origin !== "null") ? location.origin : "";
+/* OnOfre device panel.
+   The build strips this first line and injects `let baseUrl = ""` so the embedded
+   copy talks to whatever address the device was reached at. */
+
+var config = {};          // last config read from the device
+var dirty = false;        // unsaved edits in the forms
+var removed = [];         // feature ids queued for removal
+var heapHistory = [];     // free heap samples, for the sparkline
+var climateHistory = {};  // browser-only samples, keyed by feature id
+var logPaused = false;
+var logLines = [];
+var source = null;
+var featureEventHandlers = [];
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/* Drivers the firmware can create, grouped for the picker. `pins` is how many
+   GPIOs prepareNewFeature() expects — the form follows it. */
+const DRIVERS = [
+  { g: "Luzes e tomadas", items: [
+    { v: 7, t: "LIGHT_PUSH", n: "Luz · botão de pressão", pins: 1 },
+    { v: 8, t: "LIGHT_LATCH", n: "Luz · interruptor", pins: 1 },
+    { v: 1, t: "SWITCH_PUSH", n: "Tomada · botão de pressão", pins: 1 },
+    { v: 2, t: "SWITCH_LATCH", n: "Tomada · interruptor", pins: 1 },
+  ]},
+  { g: "Estores e portões", items: [
+    { v: 3, t: "COVER_SINGLE_PUSH", n: "Estore · um botão", pins: 1 },
+    { v: 4, t: "COVER_DUAL_PUSH", n: "Estore · dois botões", pins: 2 },
+    { v: 5, t: "COVER_DUAL_LATCH", n: "Estore · dois interruptores", pins: 2 },
+    { v: 9, t: "GARAGE_PUSH", n: "Portão", pins: 1 },
+    { v: 10, t: "GARDEN_VALVE", n: "Válvula de rega", pins: 1 },
+  ]},
+  { g: "Iluminação LED", items: [
+    { v: 200, t: "LED_STRIP", n: "Fita LED (WS2812 / WS2813 / WS2815)", pins: 1 },
+  ]},
+  { g: "Sensores", items: [
+    { v: 111, t: "DHT_11", n: "DHT11 · temperatura e humidade", pins: 1 },
+    { v: 121, t: "DHT_21", n: "DHT21 · temperatura e humidade", pins: 1 },
+    { v: 122, t: "DHT_22", n: "DHT22 · temperatura e humidade", pins: 1 },
+    { v: 90, t: "DS18B20", n: "DS18B20 · temperatura", pins: 1 },
+    { v: 84, t: "DOOR", n: "Sensor de porta", pins: 1 },
+    { v: 85, t: "WINDOW", n: "Sensor de janela", pins: 1 },
+    { v: 82, t: "PIR", n: "Movimento (PIR)", pins: 1 },
+    { v: 83, t: "RAIN", n: "Chuva", pins: 1 },
+    { v: 93, t: "HCSR04", n: "Distância (HC-SR04)", pins: 2 },
+    { v: 95, t: "LDC1612", n: "Contador de água (LDC1612)", pins: 2 },
+    { v: 94, t: "LD2410", n: "Presença (LD2410)", pins: 2, l: ["PINO RX", "PINO TX"] },
+    { v: 96, t: "LD2420", n: "Presença (LD2420)", pins: 2, l: ["PINO RX", "PINO TX"] },
+    { v: 97, t: "TOFSENSE", n: "Distância laser (TOFSense)", pins: 2, l: ["PINO RX", "PINO TX"] },
+    { v: 71, t: "PZEM_004T_V03", n: "Contador PZEM v3", pins: 2 },
+    { v: 72, t: "PZEM_004T_V01", n: "Contador PZEM v1", pins: 2 },
+  ]},
+];
+const driverInfo = (v) => {
+  for (const g of DRIVERS) for (const d of g.items) if (d.v === v) return d;
+  return null;
+};
+
+/* Drivers a device may report but the panel cannot create — a template or an
+   older firmware put them there, and they still deserve a readable name. */
+const EXTRA_DRIVER_LABELS = {
+  HAN_MODBUS: "Contador de energia HAN",
+  HAN_MODBUS_8N2: "Contador de energia HAN (8N2)",
+  SHT4X: "SHT4x · temperatura e humidade",
+  LTR303: "Sensor de luminosidade",
+  TMF882X: "Distância (TMF882x)",
+  LOCK_PUSH: "Fechadura",
+  INVALID: "desconhecido",
+};
+/* /config reports the driver as a token; show it in the words the apps use. */
+function driverLabel(token) {
+  if (!token) return "—";
+  for (const g of DRIVERS) for (const d of g.items) if (d.t === token) return d.n;
+  return EXTRA_DRIVER_LABELS[token] || token;
+}
+const TEMPLATES = [
+  { v: 1, n: "Duas luzes" }, { v: 2, n: "Duas tomadas" }, { v: 3, n: "Estore" },
+  { v: 4, n: "Portão" }, { v: 5, n: "Contador HAN" }, { v: 6, n: "Rega" },
+  { v: 7, n: "Contador de água" },
+];
+
+/* Inline so the panel keeps working with no network: an icon set is the first
+   thing a remote stylesheet would take away. */
+const COG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">' +
+  '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 7.5 19l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 3 13.6H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.7 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H10a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V10a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1Z"/></svg>';
+const ICONS = {
+  play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5L8 5.5Z"/></svg>',
+  stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>',
+  light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V18h8v-3.3A7 7 0 0 0 12 2Z"/></svg>',
+  socket: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="9" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/><path d="M8 16h8"/></svg>',
+  cover: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 8h18M3 12h18M3 16h18"/></svg>',
+  garage: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 21V9l9-5 9 5v12M7 21v-7h10v7M7 17h10"/></svg>',
+  valve: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 22a5 5 0 0 0 5-5c0-3.5-5-11-5-11S7 13.5 7 17a5 5 0 0 0 5 5Z"/></svg>',
+};
+function tileIcon(f) {
+  const d = String(f.driver || "");
+  if (d.indexOf("COVER") === 0) return ICONS.cover;
+  if (d.indexOf("GARAGE") === 0) return ICONS.garage;
+  if (d.indexOf("GARDEN") === 0) return ICONS.valve;
+  if (d.indexOf("LIGHT") === 0) return ICONS.light;
+  return ICONS.socket;
+}
+
+/* ---------------- irrigation ---------------- */
+/* Programs run on the device, not in the cloud: a cycle that stops halfway
+   because MQTT dropped would leave one zone soaked and the rest dry. The panel
+   only edits and shows them. */
+var irrigation = null;      // last state read from the device
+var irrDirty = false;
+
+const WEEKDAY_LABELS = ["D", "S", "T", "Q", "Q", "S", "S"];
+const WEEKDAY_NAMES = ["domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado"];
+
+const isZone = (f) => f.driver === "GARDEN_VALVE";
+const zones = () => (config.features || []).filter(isZone);
+const zoneName = (id) => (zones().find((z) => z.id === id) || {}).name || id;
+
+function hhmm(minuteOfDay) {
+  const m = Math.max(0, Math.min(1439, parseInt(minuteOfDay, 10) || 0));
+  return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+}
+function minutesFromHhmm(v) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || "").trim());
+  if (!m) return null;
+  const h = parseInt(m[1], 10), min = parseInt(m[2], 10);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+function markIrrDirty() {
+  irrDirty = true;
+  $("irr-save").disabled = false;
+}
+
+/* The tab only exists on a board that has valves, so a light switch panel is
+   not cluttered with irrigation it will never use. */
+function renderIrrigationTab() {
+  const has = zones().length > 0;
+  $("tab-irrigation").classList.toggle("hide", !has);
+  if (!has) return;
+  irrigation = config.irrigation ||
+    { enabled: true, skipOnRain: true, maxConcurrentZones: 1, programs: [] };
+  irrDirty = false;
+  $("irr-save").disabled = true;
+  renderIrrStatus();
+  renderIrrZones();
+  renderIrrPrograms();
+}
+
+/* Firmware from before concurrency sends only running.zone/secondsLeft, so treat
+   the single pair as a one-element list rather than special-casing every reader. */
+function runningZones(run) {
+  if (!run) return [];
+  return (run.zones && run.zones.length) ? run.zones : [{ zone: run.zone, secondsLeft: run.secondsLeft }];
+}
+
+function isRunningZone(run, id) {
+  return runningZones(run).some((z) => z.zone === id);
+}
+
+function maxZones() {
+  const n = parseInt(irrigation.maxConcurrentZones, 10);
+  return n >= 1 && n <= 5 ? n : 1;
+}
+
+/* Everything about the cycle except how many seconds are left: the countdown is
+   redrawn on its own, and treating it as a change would rebuild the card on every
+   poll, which is exactly what this is here to avoid. */
+function irrShape(irr) {
+  const run = (irr || {}).running;
+  return JSON.stringify([
+    !!(irr || {}).enabled, !!(irr || {}).skipOnRain, (irr || {}).maxConcurrentZones,
+    (irr || {}).programs, run ? run.programId : null,
+    run ? runningZones(run).map((z) => z.zone) : null,
+  ]);
+}
+
+function runningLines(run) {
+  if (!run) {
+    return '<div class="irr-running idle"><b>Parado</b><span>' +
+      (irrigation.enabled ? "à espera do próximo programa" : "programas desligados") + "</span></div>";
+  }
+  return runningZones(run).map((z) =>
+    '<div class="irr-running"><b>' + esc(zoneName(z.zone)) + "</b>" +
+    '<span>a regar · faltam ' + duration(z.secondsLeft) + "</span></div>").join("");
+}
+
+/* Only the countdown, never the whole card: the card holds a select and two
+   checkboxes, and rebuilding them once a second would shut the dropdown under
+   the finger of whoever is using it. */
+function refreshIrrRunning() {
+  const el = $("irr-running-list");
+  if (el) el.innerHTML = runningLines(irrigation.running);
+}
+
+function renderIrrStatus() {
+  const run = irrigation.running;
+  const rain = (config.features || []).find((f) => f.driver === "RAIN");
+  const raining = rain ? /rain/i.test(String(rain.state)) : false;
+  // A schedule with no clock is the one failure people cannot guess at, so it
+  // leads.
+  const noClock = !config.clockSynced;
+  $("irr-status").innerHTML =
+    '<div class="card irr-state">' +
+    (noClock
+      ? '<div class="note err" style="margin:0 0 10px">Sem hora certa (NTP), os programas não correm. ' +
+        "A rega manual continua disponível.</div>"
+      : "") +
+    '<div id="irr-running-list">' + runningLines(run) + "</div>" +
+    '<div class="irr-toggles">' +
+    '<label class="f-check"><input type="checkbox" id="irr-enabled"' + (irrigation.enabled ? " checked" : "") +
+      "> programas ativos</label>" +
+    '<label class="f-check"><input type="checkbox" id="irr-rain"' + (irrigation.skipOnRain ? " checked" : "") +
+      "> saltar o ciclo se estiver a chover" +
+      (raining ? ' <span class="irr-chip">está a chover</span>' : "") + "</label>" +
+    '<label class="f-row irr-max"><span>setores ao mesmo tempo</span>' +
+      '<select id="irr-max">' +
+      [1, 2, 3, 4, 5].map((n) =>
+        '<option value="' + n + '"' + (maxZones() === n ? " selected" : "") + ">" + n + "</option>").join("") +
+      "</select></label>" +
+    '<span class="irr-hint">Quantos setores a pressão da água alimenta em simultâneo. ' +
+      "Com um valor alto demais rega-se tudo mal.</span>" +
+    "</div>" +
+    (run ? '<div class="btns" style="margin-top:11px"><button class="btn d" id="irr-stop">Parar rega</button></div>' : "") +
+    "</div>";
+}
+
+function zoneSubtitle(run, id) {
+  const z = zones().find((x) => x.id === id);
+  if (!z || String(z.state) !== "100") return "fechada";
+  const clock = zoneClocks[id];
+  if (!clock) return "aberta";
+  // Short enough to stay on one line under the dial: that it is open is already
+  // said by the stop glyph and by the lit tile, so the line only carries time.
+  const cycle = runningZones(run).some((s) => s.zone === id);
+  return (cycle ? "a regar · " : "fecha em ") + mmss(clock.left);
+}
+
+/* Minutes and seconds: a ring that drains needs the seconds next to it, and
+   "9m" for the last nine minutes of a cycle reads as if nothing is happening. */
+function mmss(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
+}
+
+function renderIrrZones() {
+  const run = irrigation.running;
+  // The rule depends on the setting, so it is written from it rather than sitting
+  // in the markup saying something that may no longer be true.
+  const limit = maxZones();
+  $("irr-zones-note").textContent = limit === 1
+    ? "Só uma zona rega de cada vez — é o que a pressão da água alimenta. Abrir uma fecha "
+      + "a que estiver aberta, venha o comando daqui, do botão na parede ou da app."
+    : "Regam até " + limit + " zonas ao mesmo tempo. Abrir mais fecha a que estiver aberta "
+      + "há mais tempo, venha o comando daqui, do botão na parede ou da app.";
+  zones().forEach(readZoneClock);
+  $("irr-zones").innerHTML = zones().map((z) => {
+    const on = String(z.state) === "100";
+    const pin = (z.outputs || []).length ? "OUT " + z.outputs.join(",") : "";
+    const btn = String(z.inputs || "") ? " · IN " + z.inputs.join(",") : "";
+    return '<div class="tile-wrap"><div class="tile' + (on ? " on" : "") + '">' +
+      '<span class="tile-top">' + ICONS.valve + "</span>" +
+      "<b>" + esc(z.name) + "</b>" +
+      '<button class="zone-dial' + (on ? " on" : "") + '" data-zone="' + esc(z.id) + '"' +
+      ' aria-label="' + esc((on ? "Fechar " : "Regar ") + z.name) + '">' +
+      '<svg class="zone-ring" viewBox="0 0 72 72" aria-hidden="true">' +
+      '<circle class="zr-track" cx="36" cy="36" r="32"></circle>' +
+      '<circle class="zr-fill" cx="36" cy="36" r="32" data-zring="' + esc(z.id) + '"' +
+      ' stroke-dasharray="' + RING + '" stroke-dashoffset="' + RING + '"></circle></svg>' +
+      '<span class="zone-glyph">' + (on ? ICONS.stop : ICONS.play) + "</span></button>" +
+      '<span class="tile-sub" data-zsub="' + esc(z.id) + '">' + zoneSubtitle(run, z.id) + "</span>" +
+      '<span class="tile-pins">' + esc(pin + btn) + "</span></div></div>";
+  }).join("");
+  paintZoneClocks();
+}
+
+/* 2*pi*r for the ring drawn above. The dash pattern is one full circumference, so
+   the offset is how much of it to hide: none left to water means all of it. */
+const RING = (2 * Math.PI * 32).toFixed(2);
+
+/* Seconds left and the length the zone was given, as the device reports them. A
+   valve is always on a clock while open — the program's minutes inside a cycle,
+   its own autoOff otherwise — and the panel counts the seconds down locally so
+   the ring moves every second instead of every poll. */
+const zoneClocks = {};
+
+/* A state event says a valve opened, not for how long. Until the next read of
+   /config the panel assumes the obvious deadline — the program's minutes for a
+   zone the cycle just started, the valve's own autoOff for one opened by hand —
+   so the ring starts draining on the click and not fifteen seconds later. */
+function seedZoneClock(zone, open, run) {
+  if (!open) {
+    zone.secondsLeft = 0;
+    zone.totalSeconds = 0;
+    readZoneClock(zone);
+    return;
+  }
+  let total = 0;
+  if (run && isRunningZone(run, zone.id)) {
+    const prog = (irrigation.programs || []).find((p) => p.id === run.programId);
+    const entry = prog && (prog.zones || []).find((z) => z.uniqueId === zone.id);
+    if (entry) total = (parseInt(entry.minutes, 10) || 0) * 60;
+  }
+  if (!total) total = parseInt(zone.autoOff, 10) || 0;
+  zone.totalSeconds = total;
+  zone.secondsLeft = total;
+  readZoneClock(zone);
+}
+
+function readZoneClock(z) {
+  const total = parseInt(z.totalSeconds, 10) || 0;
+  if (String(z.state) !== "100" || !total) {
+    delete zoneClocks[z.id];
+    return;
+  }
+  const left = Math.max(0, Math.min(total, parseInt(z.secondsLeft, 10) || 0));
+  zoneClocks[z.id] = { left: left, total: total };
+}
+
+/* Only the offset and the label, never the tile: a tile rebuilt once a second is
+   a button that cannot be pressed while it is being looked at. */
+function paintZoneClocks() {
+  zones().forEach((z) => {
+    const ring = document.querySelector('[data-zring="' + cssEscape(z.id) + '"]');
+    const sub = document.querySelector('[data-zsub="' + cssEscape(z.id) + '"]');
+    const clock = zoneClocks[z.id];
+    if (ring) {
+      const fraction = clock ? clock.left / clock.total : 0;
+      ring.setAttribute("stroke-dashoffset", (RING * (1 - fraction)).toFixed(2));
+    }
+    if (sub) sub.textContent = zoneSubtitle(irrigation.running, z.id);
+  });
+}
+
+function cssEscape(value) {
+  return String(value).replace(/["\\]/g, "\\$&");
+}
+
+function renderIrrPrograms() {
+  const list = irrigation.programs || [];
+  $("irr-programs").innerHTML = list.length ? list.map((prog, i) => {
+    // A program with no zones or no days is silently dead; say so where the
+    // total would be, which is where the eye already goes.
+    const warn = !(prog.zones || []).length || !prog.weekdays;
+    return '<div class="card irr-prog" data-pi="' + i + '">' +
+    '<div class="irr-prog-head">' +
+      '<label class="f-check"><input type="checkbox" data-ip="enabled" data-pi="' + i + '"' +
+        (prog.enabled ? " checked" : "") + "> Programa " + (i + 1) + "</label>" +
+      '<div class="btns irr-prog-actions">' +
+      ((prog.zones || []).length
+        ? '<button class="btn" data-iprun="' + prog.id + '">Regar agora</button>' : "") +
+      '<span class="irr-actions-gap"></span>' +
+      '<button class="btn d" data-ipdel="' + i + '">Remover</button></div>' +
+    "</div>" +
+    '<div class="row2">' +
+      '<div class="field"><label>HORA DE INÍCIO</label>' +
+      '<input type="time" data-ip="start" data-pi="' + i + '" value="' + hhmm(prog.startMinute) + '"></div>' +
+      '<div class="field"><label>DIAS</label><div class="irr-days">' +
+      WEEKDAY_LABELS.map((lbl, d) =>
+        '<button type="button" class="irr-day' + ((prog.weekdays >> d) & 1 ? " on" : "") +
+        '" data-ipday="' + i + ":" + d + '" title="' + WEEKDAY_NAMES[d] + '">' + lbl + "</button>").join("") +
+      "</div></div>" +
+    "</div>" +
+    '<div class="sub">ZONAS E DURAÇÃO</div>' +
+    zones().map((z) => {
+      const entry = (prog.zones || []).find((x) => x.uniqueId === z.id);
+      return '<div class="irr-zline">' +
+        '<label class="f-check"><input type="checkbox" data-ipz="' + i + ":" + esc(z.id) + '"' +
+          (entry ? " checked" : "") + "> " + esc(z.name) + "</label>" +
+        '<input type="number" min="1" max="240" data-ipmin="' + i + ":" + esc(z.id) + '" value="' +
+          (entry ? entry.minutes : 10) + '"' + (entry ? "" : " disabled") + '><span>min</span></div>';
+    }).join("") +
+    '<div class="note' + (warn ? " err" : "") + '">' +
+    (!(prog.zones || []).length
+      ? "Sem zonas escolhidas — este programa não rega nada."
+      : !prog.weekdays
+        ? "Sem dias escolhidos — este programa não corre."
+        : programSummary(prog)) +
+    (prog.enabled ? "" : " Programa desligado.") + "</div>" +
+    "</div>";
+  }).join("")
+    : '<div class="note">Ainda não há programas. Cria um para a rega correr sozinha.</div>';
+}
+
+/* Editing a field must not rebuild the list it lives in: innerHTML replaces the
+   input being typed into, so the focus is lost and a half-entered time snaps
+   back. Only the derived bits are refreshed in place. */
+function refreshProgramNote(i) {
+  const card = document.querySelector('.irr-prog[data-pi="' + i + '"]');
+  if (!card) return;
+  const prog = irrigation.programs[i];
+  const note = card.querySelector(".note");
+  if (!note) return;
+  const dead = !(prog.zones || []).length || !prog.weekdays;
+  note.className = "note" + (dead ? " err" : "");
+  note.textContent =
+    (!(prog.zones || []).length
+      ? "Sem zonas escolhidas — este programa não rega nada."
+      : !prog.weekdays
+        ? "Sem dias escolhidos — este programa não corre."
+        : programSummary(prog)) +
+    (prog.enabled ? "" : " Programa desligado.");
+}
+
+function programTotal(prog) {
+  return (prog.zones || []).reduce((a, z) => a + (parseInt(z.minutes, 10) || 0), 0);
+}
+
+/* How long the cycle actually takes. With zones in parallel the sum of the
+   minutes stops being the answer: each zone starts as a slot frees up, so the
+   cycle ends with the slot that finishes last. */
+function programElapsed(prog, limit) {
+  const slots = new Array(Math.max(1, limit)).fill(0);
+  (prog.zones || []).forEach((z) => {
+    const first = slots.indexOf(Math.min.apply(null, slots));
+    slots[first] += parseInt(z.minutes, 10) || 0;
+  });
+  return Math.max.apply(null, slots);
+}
+
+function programSummary(prog) {
+  const limit = maxZones();
+  const total = programTotal(prog);
+  const elapsed = programElapsed(prog, limit);
+  return limit === 1 || elapsed === total
+    ? "Total " + total + " min, por esta ordem."
+    : total + " min de rega em " + elapsed + " min, até " + limit + " setores ao mesmo tempo.";
+}
+
+async function saveIrrigation() {
+  const body = {
+    enabled: $("irr-enabled").checked,
+    skipOnRain: $("irr-rain").checked,
+    maxConcurrentZones: parseInt($("irr-max").value, 10) || 1,
+    programs: irrigation.programs || [],
+  };
+  const msg = $("irr-msg");
+  msg.className = "note";
+  msg.textContent = "A guardar…";
+  try {
+    irrigation = await api("/irrigation", { method: "POST", body: JSON.stringify(body) });
+    config.irrigation = irrigation;
+    irrDirty = false;
+    $("irr-save").disabled = true;
+    msg.className = "note ok";
+    msg.textContent = "Programas guardados no equipamento.";
+    renderIrrStatus();
+    renderIrrPrograms();
+  } catch (e) {
+    if (e.auth) return;
+    msg.className = "note err";
+    msg.textContent = "O equipamento recusou os programas.";
+  }
+}
+
+async function runProgramNow(programId) {
+  // The equipment runs its own copy of the program, by id. Asking it to run one
+  // it has never been told about cannot work — and reloading afterwards used to
+  // throw away the unsaved edits, which looked exactly like the program being
+  // deleted by the button that was supposed to start it.
+  if (irrDirty) { toast("Guarda os programas primeiro", "err"); return; }
+  try {
+    irrigation = await api("/irrigation-run", { method: "POST", body: JSON.stringify({ programId: programId }) });
+    config.irrigation = irrigation;
+    renderIrrStatus();
+    renderIrrZones();
+  } catch (e) { toast("Não foi possível arrancar o programa", "err"); }
+}
+
+async function stopIrrigation() {
+  try {
+    irrigation = await api("/irrigation-stop", { method: "POST" });
+    config.irrigation = irrigation;
+    // Only the state and the zones change; the programs on screen are untouched,
+    // including anything being edited.
+    renderIrrStatus();
+    renderIrrZones();
+  } catch (e) { toast("Não foi possível parar", "err"); }
+}
+
+/* The device answers first and performs the update in its main loop. The safe
+   updater temporarily stops the web server, so a missed poll means only "still
+   unavailable" — never success. Success is confirmed only after the restarted
+   firmware answers; ESP8266 failures are shown after its controlled recovery
+   reboot restores the journaled error. */
+function followUpdate() {
+  const bar = $("ota-bar");
+  const fill = bar.querySelector("i");
+  const msg = $("ota-msg");
+  const startingVersion = String(config.firmware || "");
+  const startingBuildDate = String(config.buildDate || "");
+  const startingBootId = String(config.bootId || "");
+  const deadline = Date.now() + 180000;
+  bar.classList.remove("hide");
+  bar.classList.add("indeterminate");
+  bar.removeAttribute("aria-valuenow");
+  bar.setAttribute("aria-valuetext", "A descarregar e instalar");
+  fill.style.width = "0";
+  msg.className = "note";
+  msg.textContent = "A descarregar e instalar — o painel ficará temporariamente indisponível. Não desligues o equipamento.";
+  $("a-update").disabled = true;
+
+  let finished = false;
+  const setProgress = (percent) => {
+    const value = Math.max(0, Math.min(100, Number(percent) || 0));
+    bar.classList.remove("indeterminate");
+    fill.style.width = value + "%";
+    bar.setAttribute("aria-valuenow", String(value));
+    bar.setAttribute("aria-valuetext", value + "%");
+  };
+  const finish = (ok, text, percent) => {
+    finished = true;
+    bar.classList.remove("indeterminate");
+    if (percent != null) setProgress(percent);
+    else bar.setAttribute("aria-valuetext", text);
+    msg.className = ok ? "note ok" : "note err";
+    msg.textContent = text;
+    $("a-update").disabled = false;
+  };
+  const confirmAndReload = (version) => {
+    finish(true, "Atualização confirmada · versão " + version + ". A reabrir o painel…", 100);
+    // Do not let the old page reconnect its EventSource while the new firmware
+    // is loading. replace() performs a real document navigation and keeps the
+    // Back button from returning to this stale pre-update panel.
+    $("a-update").disabled = true;
+    if (source) {
+      source.close();
+      source = null;
+    }
+    setTimeout(() => window.location.replace(baseUrl + "/"), 900);
+  };
+
+  const poll = async () => {
+    if (finished) return;
+    let snapshot;
+    try {
+      // Safari may otherwise reuse the pre-reboot snapshot and leave the bar
+      // waiting at the end even though the new firmware is already online.
+      snapshot = await api("/config?otaPoll=" + Date.now(), { cache: "no-store" });
+    } catch (e) {
+      if (Date.now() >= deadline) {
+        finish(false, "Não foi possível confirmar o resultado. Volta a abrir a página e verifica a versão instalada.");
+        return;
+      }
+      setTimeout(poll, 1500);
+      return;
+    }
+
+    const ota = snapshot.ota || null;
+    const versionChanged = startingVersion && snapshot.firmware &&
+      String(snapshot.firmware) !== startingVersion;
+    const buildChanged = startingBuildDate && snapshot.buildDate &&
+      String(snapshot.buildDate) !== startingBuildDate;
+    const bootChanged = startingBootId && snapshot.bootId &&
+      String(snapshot.bootId) !== startingBootId;
+    if (versionChanged || buildChanged) {
+      confirmAndReload(snapshot.firmware);
+      return;
+    }
+    if (!ota) {
+      if (Date.now() >= deadline)
+        finish(false, "O equipamento respondeu, mas não confirmou a atualização.");
+      else
+        setTimeout(poll, 1500);
+      return;
+    }
+    if (ota.state === "running" && ota.percent > 0) setProgress(ota.percent);
+    if (ota.state === "failed") {
+      if (ota.percent > 0) setProgress(ota.percent);
+      finish(false, "A atualização falhou: " + (ota.error || "sem detalhe do equipamento"));
+    } else if (bootChanged) {
+      finish(false, "O equipamento reiniciou, mas continua na versão " + snapshot.firmware + ". A atualização falhou.");
+    } else if (ota.state === "done") {
+      // Flash completion is not the end of the user-visible operation. Keep
+      // polling until the restarted device answers with a different version;
+      // otherwise a failed restart would be presented as a successful update.
+      setProgress(100);
+      msg.textContent = "Firmware gravado. A aguardar reinício e confirmação…";
+      setTimeout(poll, 1500);
+    } else if (Date.now() >= deadline) {
+      finish(false, "A atualização não terminou dentro do tempo esperado. Verifica a versão antes de repetir.");
+    } else {
+      setTimeout(poll, 1500);
+    }
+  };
+  setTimeout(poll, 1500);
+}
+
+/* The device keeps its own short log; this is the only way to read it without a
+   cable, which is the whole point. Plain text on purpose: it goes straight into a
+   message. */
+async function loadDeviceLog() {
+  const box = $("d-devlog");
+  box.textContent = "";
+  try {
+    const res = await fetch(baseUrl + "/logs", { headers: { Accept: "text/plain" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const text = (await res.text()).trim();
+    if (!text) {
+      box.innerHTML = '<div class="dim">o equipamento ainda não registou nada</div>';
+      return;
+    }
+    box.innerHTML = text.split("\n").map((l) => "<div>" + esc(l) + "</div>").join("");
+    box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    box.innerHTML = '<div class="e">não foi possível ler o registo do equipamento</div>';
+  }
+}
+
+/* ---------------- theme ---------------- */
+/* The choice lives in localStorage, not in the device config: it belongs to
+   whoever is looking, and writing it to the device would burn flash on a
+   preference the next browser would not share. The <head> applies it before
+   the first paint; this only handles the toggle. */
+const THEME_KEY = "onofre-theme";
+const SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">' +
+  '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>';
+const MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>';
+
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+}
+function applyTheme(name) {
+  document.documentElement.setAttribute("data-theme", name);
+  try { localStorage.setItem(THEME_KEY, name); } catch (e) { /* private mode */ }
+  const btn = $("theme-btn");
+  if (btn) {
+    // Show what the click will do, not what is on screen.
+    btn.innerHTML = name === "light" ? MOON : SUN;
+    btn.title = name === "light" ? "Tema escuro" : "Tema claro";
+  }
+  drawSpark("d-heap-spark", heapHistory, accent());
+}
+/* Charts are drawn, not styled, so they have to read the token themselves. */
+function accent() {
+  return getComputedStyle(document.documentElement).getPropertyValue("--grn").trim() || "#97d700";
+}
+
+/* ---------------- helpers ---------------- */
+function toast(msg, kind) {
+  const t = $("toast");
+  const isError = kind === "err";
+  t.setAttribute("role", isError ? "alert" : "status");
+  t.setAttribute("aria-live", isError ? "assertive" : "polite");
+  $("toast-msg").textContent = msg;
+  t.className = "on " + (kind || "");
+  clearTimeout(toast._t);
+  // Errors need enough time to be read on a phone; every toast can also be
+  // dismissed immediately without stealing keyboard focus from the form.
+  toast._t = setTimeout(dismissToast, isError ? 9000 : 4200);
+}
+function dismissToast() {
+  clearTimeout(toast._t);
+  $("toast").className = "";
+}
+/* The save button lives in the header and starts disabled, so both of these
+   have to drive it — otherwise there is nothing to press. */
+function markDirty() {
+  dirty = true;
+  $("dirty").classList.remove("hide");
+  $("save-btn").disabled = false;
+}
+function clearDirty() {
+  dirty = false;
+  $("dirty").classList.add("hide");
+  $("save-btn").disabled = true;
+}
+
+/* A diagnostics refresh returns the complete config, including features. Those
+   feature objects may contain unsaved name, pin, or timing edits, so replacing
+   them here would make the later Save silently send the old device values. */
+function applyDiagnosticsSnapshot(snapshot) {
+  Object.keys(snapshot || {}).forEach((key) => {
+    if (key !== "features") config[key] = snapshot[key];
+  });
+}
+
+function duration(sec) {
+  sec = Math.floor(sec || 0);
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d) return d + "d " + String(h).padStart(2, "0") + "h";
+  if (h) return h + "h " + String(m).padStart(2, "0") + "m";
+  return m + "m";
+}
+function rssiText(dbm) {
+  if (dbm == null) return "—";
+  const q = dbm >= -60 ? "bom" : dbm >= -70 ? "razoável" : dbm >= -80 ? "fraco" : "muito fraco";
+  return dbm + " dBm · " + q;
+}
+function rssiClass(dbm) {
+  const signal = Number(dbm);
+  if (dbm == null || !Number.isFinite(signal) || signal === 0) return "off";
+  // A weak station link is degraded, not disconnected. Reserve red for an
+  // actual failed service/link instead of alarming on a connected -81 dBm AP.
+  return signal >= -70 ? "ok" : "warn";
+}
+
+async function api(path, opts) {
+  let res;
+  const busyDeadline = Date.now() + 2000;
+  for (;;) {
+    res = await fetch(baseUrl + path, Object.assign(
+      { headers: { "Content-Type": "application/json", "Accept": "application/json" } }, opts || {}));
+    if (res.status !== 409 || Date.now() >= busyDeadline) break;
+    // A failed acquisition reserves the next lease for foreground work. Retry
+    // beyond the 100 ms handoff window so a long-running current owner can
+    // finish without making a transient feature-loop collision user-visible.
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+  const txt = await res.text();
+  let body = null;
+  try { body = txt ? JSON.parse(txt) : null; } catch (e) { /* not JSON */ }
+  if (!res.ok) {
+    // A refusal carries {result:<code>}; keep it so callers can explain why.
+    const err = new Error("HTTP " + res.status);
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+
+/* ---------------- load & render ---------------- */
+async function load() {
+  try {
+    config = await api("/config");
+  } catch (e) {
+    toast("Não foi possível ler a configuração", "err");
+    return;
+  }
+  removed = [];
+  renderHeader();
+  renderOverview();
+  renderPinout();
+  renderFeatures();
+  renderDiag();
+  fillSystem();
+  fillNewFeatureForm();
+  renderIrrigationTab();
+  wireFeatureEvents();
+}
+
+function renderHeader() {
+  $("h-name").textContent = config.nodeId || "—";
+  $("h-chip").textContent = config.chipId || "";
+  // `mcu` is the update folder name (a C3 reports "ESP32"); the real chip is in backupVariant.
+  $("h-mcu").textContent = config.backupVariant || config.mcu || "";
+  $("h-fw").textContent = config.firmware || "—";
+  const w = $("h-wifi");
+  w.className = "pill " + rssiClass(config.signal);
+  w.innerHTML = "WiFi <b>" + esc(rssiText(config.signal)) + "</b>";
+  setMqttPill(config.mqttConnected);
+  $("h-up").innerHTML = "ligado há <b>" + duration(config.uptime) + "</b>";
+}
+function setFirmwareHeaderState(state, latest) {
+  const badge = $("h-fw-link");
+  const latestLabel = $("h-fw-latest");
+  badge.classList.remove("available", "error");
+  badge.disabled = true;
+  latestLabel.textContent = "";
+  if (state === "available") {
+    badge.classList.add("available");
+    badge.disabled = false;
+    latestLabel.textContent = latest;
+    badge.title = "Atualização " + latest + " disponível — abrir Firmware";
+    badge.setAttribute("aria-label", "Atualização de firmware " + latest + " disponível. Abrir Firmware");
+  } else if (state === "error") {
+    badge.classList.add("error");
+    badge.title = "Não foi possível verificar atualizações";
+    badge.setAttribute("aria-label", "Não foi possível verificar atualizações");
+  } else {
+    badge.title = "Firmware instalado";
+    badge.setAttribute("aria-label", "Firmware instalado " + (config.firmware || "desconhecido"));
+  }
+}
+function setStatusBadge(el, state, text) {
+  if (!el) return;
+  el.className = "status-badge health-badge " + state;
+  el.textContent = text;
+}
+function setMqttPill(on) {
+  const configured = Boolean((config.mqttIpDns || "").trim());
+  const state = !configured ? "off" : on ? "ok" : "bad";
+  const text = !configured ? "desativado" : on ? "ligado" : "sem ligação";
+  const m = $("h-mqtt");
+  m.className = "pill " + state;
+  m.innerHTML = "MQTT <b>" + text + "</b>";
+  setStatusBadge($("d-mqtt"), state, text);
+}
+
+const isActuator = (f) => f.group === "ACTUATOR";
+const isCover = (f) => (f.driver || "").indexOf("COVER") === 0;
+/* ActuatorControlType::VIRTUAL. A virtual switch drives no output of its own: it
+   is a wall button that commands other relays over KNX. Showing it among the
+   accessories offers a switch whose state reflects nothing in the house, so the
+   dashboard leaves it out. It stays visible where it belongs — in FUNÇÕES, where
+   it is configured, and in the pinout, where its input is spoken for. */
+const isVirtual = (f) => f.typeControl === 2;
+const isDashboardAccessory = (f) => isActuator(f) && !isVirtual(f);
+const tileAction = (on) => on ? "desligar" : "ligar";
+const BINARY_STATE_DRIVERS = ["LIGHT_PUSH", "LIGHT_LATCH", "SWITCH_PUSH", "SWITCH_LATCH"];
+const hasBinaryFunctionState = (f) => isActuator(f) && !isVirtual(f) &&
+  BINARY_STATE_DRIVERS.indexOf(f.driver) >= 0;
+
+function setToggleTileState(tile, on) {
+  tile.classList.toggle("on", on);
+  tile.setAttribute("aria-pressed", String(on));
+  const action = tileAction(on);
+  const subtitle = tile.querySelector(".tile-sub");
+  if (subtitle) subtitle.textContent = action;
+  const name = tile.querySelector("b");
+  tile.setAttribute("aria-label", action + (name ? " " + name.textContent : " acessório"));
+}
+
+function setFeatureCardState(feature) {
+  if (!hasBinaryFunctionState(feature)) return;
+  const on = (parseInt(feature.state, 10) || 0) > 0;
+  const card = $("fc-" + feature.id);
+  if (card) card.classList.toggle("on", on);
+  const badge = $("fs-" + feature.id);
+  if (badge) {
+    badge.className = "feature-badge feature-state " + (on ? "on" : "off");
+    badge.textContent = on ? "LIGADO" : "DESLIGADO";
+  }
+}
+
+function applyFeatureState(id, state) {
+  const feature = (config.features || []).find((f) => f.id === id);
+  if (!feature) return null;
+  feature.state = state;
+  setFeatureCardState(feature);
+  return feature;
+}
+
+async function refreshFeatureStates() {
+  try {
+    const snapshot = await api("/config?featureState=" + Date.now(), { cache: "no-store" });
+    (snapshot.features || []).forEach((fresh) => applyFeatureState(fresh.id, fresh.state));
+  } catch (e) {
+    // EventSource still carries live updates. A transient refresh failure must
+    // not block navigation or discard edits already made in the Function form.
+  }
+}
+
+/* Jump from a tile straight to that feature's settings, highlighted so it is
+   obvious which of a long list was meant. */
+function openFeatureConfig(id) {
+  document.querySelector('[data-view="features"]').click();
+  const idx = (config.features || []).findIndex((f) => f.id === id);
+  if (idx < 0) return;
+  const card = document.querySelector('[data-fi="' + idx + '"]');
+  if (!card) return;
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  card.classList.add("flash");
+  setTimeout(() => card.classList.remove("flash"), 1600);
+  const name = card.querySelector('[data-f="name"]');
+  if (name) name.focus();
+}
+
+function renderOverview() {
+  const feats = config.features || [];
+  const acts = feats.filter(isDashboardAccessory);
+  const sens = feats.filter((f) => !isActuator(f));
+
+  // Tiles rather than full-width rows: an accessory is a small thing and reads
+  // better as a grid, the way a phone's home app lays them out. Each tile is
+  // wrapped because the cog cannot live inside the button that toggles it.
+  $("ov-actuators").innerHTML = (acts.length || config.ledStrip) ? '<div class="tiles">' + acts.map((f) => {
+    const state = parseInt(f.state, 10) || 0;
+    const pins = (f.outputs || []).length ? "OUT " + f.outputs.join(",") : "";
+    const ins = (f.inputs || []).length ? "IN " + f.inputs.join(",") : "";
+    const meta = '<span class="tile-pins">' + esc([pins, ins].filter(Boolean).join(" · ")) + "</span>";
+    const cog = '<button type="button" class="cog" data-config="' + esc(f.id) +
+      '" title="Configurar" aria-label="Configurar ' + esc(f.name) + '">' + COG + "</button>";
+    // Firmware state for a cover is how CLOSED it is (OFF_OPEN=0, ON_CLOSE=100);
+    // the panel speaks in "% open", so convert here and on the way back.
+    const openPct = isCover(f) ? 100 - state : state;
+    const body = isCover(f)
+      ? '<div class="tile cover' + (openPct > 0 ? " on" : "") + '">' +
+        '<span class="tile-top">' + tileIcon(f) + "</span>" +
+        "<b>" + esc(f.name) + "</b>" +
+        '<span class="tile-sub">' + openPct + "% aberto</span>" +
+        '<input type="range" min="0" max="100" value="' + openPct + '" data-cover="' + esc(f.id) + '">' +
+        meta + "</div>"
+      // The tile itself is the switch, so the whole surface is the target.
+      : '<button type="button" class="tile tap' + (state > 0 ? " on" : "") + '" data-toggle="' +
+        esc(f.id) + '" aria-pressed="' + (state > 0 ? "true" : "false") +
+        '" aria-label="' + tileAction(state > 0) + " " + esc(f.name) + '">' +
+        '<span class="tile-top">' + tileIcon(f) + "</span>" +
+        "<b>" + esc(f.name) + "</b>" +
+        '<span class="tile-sub">' + tileAction(state > 0) + "</span>" +
+        meta + "</button>";
+    return '<div class="tile-wrap">' + body + cog + "</div>";
+  }).join("") + ledTile() + "</div>" : '<div class="note">Sem acessórios configurados.</div>';
+
+  ledSync();
+
+  $("ov-sensors-title").classList.toggle("hide", !sens.length);
+  $("ov-sensors").innerHTML = sens.map((f) => isEnergy(f) ? energyCard(f) :
+    isClimate(f) ? climateCard(f, true) :
+      // A reading with a unit gets the same room as a climate card; a door or a
+      // motion sensor is one word and stays narrow.
+      '<div class="card' + (MEASURE_DRIVERS.indexOf(f.driver) >= 0 ? " wide" : "") +
+      '"><h4>' + esc(f.name) + '</h4><div class="fval" id="sv-' + esc(f.id) + '">' +
+      esc(sensorText(f.state, f.driver)) + "</div></div>").join("");
+}
+
+
+/* ---------------- LED strip (WLED Full Edition: Palettes, 3-Colors, Geometry, Presets, Nightlight, Peek) ---------------- */
+const LED_EFFECTS = [
+  ["Static", "Fixo"], ["Blink", "Piscar"], ["Breathe", "Respirar"], ["Rainbow", "Arco-íris"],
+  ["Color Wipe", "Varrimento"], ["Chase", "Perseguição"], ["Scan", "Scanner"],
+  ["Twinkle", "Cintilar"], ["Fire", "Fogo"], ["Meteor", "Meteoro"],
+  ["Strobe", "Estroboscópio"], ["Color Cycle", "Ciclo de cor"], ["Theater Rainbow", "Teatro arco-íris"],
+  ["Running Lights", "Luzes em movimento"], ["Sparkle", "Faíscas"], ["Plasma", "Plasma"],
+  ["Confetti", "Confetti"], ["Lightning", "Relâmpago"], ["Candle", "Vela"], ["Police", "Polícia"],
+  ["Heartbeat", "Batimento"], ["Juggle", "Malabarismo"], ["Gradient", "Gradiente"], ["Noise", "Nuvens"],
+  ["Sinelon", "Sinelon"], ["Bouncing Balls", "Bolas Saltitantes"], ["Fireworks", "Fogo de Artifício"],
+  ["Pacifica", "Pacifica"], ["Colorwaves", "Ondas de Cor"], ["TwinkleFox", "TwinkleFox"], ["TwinkleCat", "TwinkleCat"],
+];
+const LED_PALETTES = ["Default (Cor Única)","Rainbow","Party","Ocean","Forest","Lava","Cloud","Heat","Sunset","Aurora","Cyberpunk","Pastel","Sakura","Fire & Ice","Breeze","Ice","Autumn","Sherbet","Riviera","Beach","Splash","Analogous","Red & Blue","Yelblu","Orangery","C9","Candy","Tiamat","April","Jul","Grintage","Rewhi","Tertiary","Matrix","Synthwave","Gold","Magenta","Emerald","Volcano","Deep Space","Halloween","Christmas","Custom 1","Custom 2","Custom 3","Custom 4","Duo (Cor 1+2)","Tri (Cor 1+2+3)","Gradiente Cor 1"];
+const LED_PALETTE_GRADIENTS = ["#ffa03c 0%, #ffa03c 100%","#ff0000 0%, #ffff00 16%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 84%, #ff0000 100%","#5500ab 0%, #b5006e 20%, #ff5500 40%, #ffd000 60%, #ff006a 80%, #5500ab 100%","#001233 0%, #0353a4 29%, #00b4d8 61%, #90e0ef 84%, #caf0f8 100%","#081c15 0%, #1b4332 29%, #2d6a4f 61%, #52b788 84%, #b7e4c7 100%","#000000 0%, #7f0000 25%, #e62400 55%, #ff7700 82%, #ffff88 100%","#4a90e2 0%, #a3cef1 33%, #ffffff 67%, #70a9e6 100%","#000000 0%, #b30000 33%, #ff8800 69%, #ffff40 92%, #ffffff 100%","#2b0b3f 0%, #901f5b 27%, #e85d04 57%, #faa307 84%, #ffdf7a 100%","#041f2b 0%, #00875a 25%, #38ef7d 55%, #00d2ff 80%, #7b2cbf 100%","#00f5d4 0%, #00bbf9 33%, #9b5de5 67%, #f15bb5 100%","#ffadad 0%, #ffd6a5 25%, #caffbf 50%, #9bf6ff 75%, #bdb2ff 100%","#590d22 0%, #c9184a 31%, #ff758f 67%, #fff0f3 100%","#ff3800 0%, #ffaa00 33%, #ffffff 50%, #00d4ff 69%, #0033cc 100%","#064e3b 0%, #10b981 37%, #97d700 73%, #ecfccb 100%","#0f172a 0%, #1d4ed8 33%, #38bdf8 69%, #f0f9ff 100%","#451a03 0%, #b45309 33%, #ea580c 67%, #facc15 100%","#ff595e 0%, #ffca3a 33%, #8ac926 67%, #1982c4 100%","#003865 0%, #0081a7 25%, #00afb9 55%, #fdfcdc 80%, #fed9b7 100%","#fff8dc 0%, #fde68a 25%, #38bdf8 53%, #0284c7 78%, #1d4ed8 100%","#075985 0%, #0ea5e9 27%, #38bdf8 57%, #bae6fd 82%, #ffffff 100%","#1d4ed8 0%, #7c3aed 25%, #db2777 50%, #e11d48 75%, #1d4ed8 100%","#ff0000 0%, #7f007f 25%, #0000ff 50%, #7f007f 75%, #ff0000 100%","#ffff00 0%, #88cc44 25%, #0088cc 50%, #001f7f 75%, #ffff00 100%","#7c2d12 0%, #ea580c 27%, #f97316 55%, #fbbf24 80%, #fef08a 100%","#ef4444 0%, #22c55e 25%, #3b82f6 50%, #f59e0b 75%, #ef4444 100%","#ff4d6d 0%, #ff8fa3 25%, #fff0f3 50%, #a5f3fc 75%, #38bdf8 100%","#220044 0%, #0066cc 25%, #00e5ff 50%, #ff66aa 75%, #ffd54f 100%","#0a0e27 0%, #1e3a8a 25%, #4f46e5 50%, #a855f7 75%, #38bdf8 100%","#7f1d1d 0%, #dc2626 25%, #15803d 50%, #16a34a 75%, #facc15 100%","#264653 0%, #2a9d8f 25%, #e9c46a 50%, #f4a261 75%, #e76f51 100%","#dc2626 0%, #ffffff 25%, #dc2626 50%, #ffffff 75%, #dc2626 100%","#ff0000 0%, #00ff00 33%, #0000ff 67%, #ff0000 100%","#001a00 0%, #006600 29%, #00cc33 59%, #66ff66 84%, #ccffcc 100%","#10002b 0%, #7b2cbf 25%, #ff007f 50%, #ff9e00 75%, #00f5d4 100%","#422006 0%, #a16207 27%, #eab308 57%, #fde047 82%, #fef9c3 100%","#2e0249 0%, #7b1fa2 27%, #d500f9 55%, #ff4081 80%, #ffc1e3 100%","#022c22 0%, #065f46 27%, #10b981 57%, #6ee7b7 82%, #d1fae5 100%","#111827 0%, #7f1d1d 25%, #ef4444 55%, #f97316 80%, #fde047 100%","#030712 0%, #1e1b4b 25%, #4338ca 53%, #7e22ce 78%, #ec4899 100%","#1f092d 0%, #6b21a8 27%, #ea580c 57%, #f97316 82%, #84cc16 100%","#991b1b 0%, #ef4444 25%, #ffffff 50%, #22c55e 75%, #166534 100%","#97d700 0%, #00d2ff 50%, #1e293b 100%","#ff6b35 0%, #f7c59f 50%, #2ec4b6 100%","#ec4899 0%, #8b5cf6 50%, #06b6d4 100%","#f59e0b 0%, #ef4444 50%, #450a0a 100%","#ffa03c 0%, #1e3a8a 50%, #ffa03c 100%","#ffa03c 0%, #1e3a8a 50%, #ffffff 100%","#ffa03c 0%, #33200c 50%, #ffa03c 100%"];
+const LED_CUSTOM_START = 42;
+const LED_CUSTOM_COUNT = 4;
+const LED_DYN_START = 46;
+const LED_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">' +
+  '<rect x="2" y="8.5" width="20" height="7" rx="3.5"/><circle cx="7" cy="12" r=".9" fill="currentColor"/>' +
+  '<circle cx="12" cy="12" r=".9" fill="currentColor"/><circle cx="17" cy="12" r=".9" fill="currentColor"/></svg>';
+let ledState = null, ledBusy = 0, ledTimer = null, ledOn = false, ledSeg = -1, ledSig = "", ledPeekRaf = 0;
+const ledHex = (c) => "#" + [c.r, c.g, c.b].map((x) => (x | 0).toString(16).padStart(2, "0")).join("");
+const ledRgb = (h) => ({ r: parseInt(h.substr(1, 2), 16), g: parseInt(h.substr(3, 2), 16), b: parseInt(h.substr(5, 2), 16) });
+function ledTarget() {
+  return ledState && ledState.segs && ledSeg >= 0 && ledSeg < ledState.segs.length ? ledSeg : -1;
+}
+function ledView() {
+  const t = ledTarget(), s = ledState, g = s.segs[t >= 0 ? t : 0];
+  return {
+    color: g.color, color2: g.color2 || { r: 0, g: 0, b: 0 }, color3: g.color3 || { r: 255, g: 255, b: 255 },
+    brightness: t >= 0 ? g.brightness : s.brightness, effect: g.effect,
+    palette: g.paletteId || 0, reverse: !!g.reverse, mirror: !!g.mirror,
+    grouping: g.grouping || 1, spacing: g.spacing || 0, offset: g.offset || 0,
+    speed: g.speed, intensity: g.intensity, on: t >= 0 ? g.on : s.on
+  };
+}
+function ledUpdatePalettePreview(palIdx, col, col2, col3) {
+  const bar = $("led-pal-preview");
+  if (!bar) return;
+  const idx = +palIdx;
+  if (idx === 0) {
+    bar.style.background = col ? ledHex(col) : "#ffa03c";
+  } else if (idx >= LED_DYN_START) {
+    const h1 = col ? ledHex(col) : "#ffa03c", h2 = col2 ? ledHex(col2) : "#000000", h3 = col3 ? ledHex(col3) : "#ffffff";
+    const di = idx - LED_DYN_START;
+    if (di === 0) bar.style.background = "linear-gradient(90deg," + h1 + " 0%," + h2 + " 50%," + h1 + " 100%)";
+    else if (di === 1) bar.style.background = "linear-gradient(90deg," + h1 + " 0%," + h2 + " 33%," + h3 + " 66%," + h1 + " 100%)";
+    else bar.style.background = "linear-gradient(90deg," + h1 + " 0%,#22160a 50%," + h1 + " 100%)";
+  } else {
+    const grad = LED_PALETTE_GRADIENTS[idx];
+    bar.style.background = grad ? "linear-gradient(90deg, " + grad + ")" : "#ffa03c";
+  }
+}
+const LED_PAL_CACHE = {};
+function ledParseStops(idx) {
+  if (LED_PAL_CACHE[idx]) return LED_PAL_CACHE[idx];
+  const raw = LED_PALETTE_GRADIENTS[idx] || "";
+  const out = [];
+  raw.split(",").forEach((part) => {
+    const m = part.trim().match(/#([0-9a-f]{6})s+(d+)%/i);
+    if (m) {
+      const n = parseInt(m[1], 16);
+      out.push({ t: parseInt(m[2], 10) / 100, r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 });
+    }
+  });
+  out.sort((a, b) => a.t - b.t);
+  LED_PAL_CACHE[idx] = out;
+  return out;
+}
+function ledBlend(a, b, t) {
+  const k = t < 0 ? 0 : t > 1 ? 1 : t;
+  return { r: a.r + (b.r - a.r) * k, g: a.g + (b.g - a.g) * k, b: a.b + (b.b - a.b) * k };
+}
+function ledScale(c, f) {
+  const k = f < 0 ? 0 : f > 1 ? 1 : f;
+  return { r: c.r * k, g: c.g * k, b: c.b * k };
+}
+function ledAddSat(a, b) {
+  return { r: Math.min(255, a.r + b.r), g: Math.min(255, a.g + b.g), b: Math.min(255, a.b + b.b) };
+}
+function ledHsv(h, s, v) {
+  const hh = h - Math.floor(h), i = Math.floor(hh * 6), f = hh * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  let r = 0, g = 0, b = 0;
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break; case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break; case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break; default: r = v; g = p; b = q; break;
+  }
+  return { r: r * 255, g: g * 255, b: b * 255 };
+}
+function ledHash(n) {
+  let x = ((n << 13) ^ n) | 0;
+  x = (Math.imul(x, Math.imul(x, 15731) + 789221) + 1376312589) | 0;
+  return (x & 0x7fffffff) / 2147483648;
+}
+function ledPalSample(palIdx, t, c1, c2, c3) {
+  if (!palIdx || palIdx <= 0) return c1;
+  let w = t - Math.floor(t);
+  if (w < 0) w += 1;
+  if (palIdx >= LED_DYN_START) {
+    const di = palIdx - LED_DYN_START;
+    if (di === 0) return w < 0.5 ? ledBlend(c1, c2, w * 2) : ledBlend(c2, c1, (w - 0.5) * 2);
+    if (di === 1) {
+      if (w < 0.3333) return ledBlend(c1, c2, w * 3);
+      if (w < 0.6666) return ledBlend(c2, c3, (w - 0.3333) * 3);
+      return ledBlend(c3, c1, (w - 0.6666) * 3);
+    }
+    const dim = ledScale(c1, 0.18);
+    return w < 0.5 ? ledBlend(c1, dim, w * 2) : ledBlend(dim, c1, (w - 0.5) * 2);
+  }
+  const st = ledParseStops(palIdx);
+  if (!st.length) return c1;
+  if (w <= st[0].t || st.length === 1) return st[0];
+  if (w >= st[st.length - 1].t) return st[st.length - 1];
+  for (let i = 0; i < st.length - 1; i++) {
+    if (w >= st[i].t && w <= st[i + 1].t) {
+      return ledBlend(st[i], st[i + 1], (w - st[i].t) / Math.max(0.001, st[i + 1].t - st[i].t));
+    }
+  }
+  return st[st.length - 1];
+}
+function ledPeekTick(now) {
+  const cv = $("led-peek");
+  if (!cv) { ledPeekRaf = 0; return; }
+  const ctx = cv.getContext("2d");
+  const w = cv.width, h = cv.height;
+  ctx.fillStyle = "#0b0e14";
+  ctx.fillRect(0, 0, w, h);
+  if (ledState && ledState.on) {
+    const v = ledView();
+    if (v.on) {
+      const physN = Math.min(60, Math.max(12, ledState.leds || 30));
+      const cell = w / physN;
+      const rate = 0.1 + ((v.speed || 0) / 255) * 3.9;
+      const ph = (now / 1000) * rate;
+      const fr = ph - Math.floor(ph);
+      const bri = Math.max(0.15, (v.brightness || 255) / 255);
+      const grp = Math.max(1, v.grouping || 1), spc = Math.max(0, v.spacing || 0), str = grp + spc;
+      const vn = Math.max(1, Math.ceil(physN / str));
+      const c1 = v.color || { r: 255, g: 160, b: 60 }, c2 = v.color2 || { r: 0, g: 0, b: 0 }, c3 = v.color3 || { r: 255, g: 255, b: 255 };
+      const pal = v.palette || 0, fx = v.effect || "Static", inten = v.intensity ?? 128;
+      const pc = (t) => ledPalSample(pal, t, c1, c2, c3);
+      const vpx = new Array(vn);
+      for (let i = 0; i < vn; i++) {
+        const u = vn > 1 ? i / (vn - 1) : 0;
+        let col = c1;
+        if (fx === "Static") {
+          col = pal === 0 ? c1 : pc(u);
+        } else if (fx === "Blink") {
+          col = fr < 0.5 ? pc(u) : c2;
+        } else if (fx === "Breathe") {
+          col = ledBlend(c2, pc(ph * 0.15 + i / (vn * 2)), (Math.sin(ph * 6.283) + 1) * 0.5);
+        } else if (fx === "Rainbow") {
+          const t = (i / vn) * (1 + Math.floor(inten / 64)) + fr;
+          col = pal === 0 ? ledHsv(t, 1, 1) : pc(t);
+        } else if (fx === "Color Wipe") {
+          const p = fr * 2, lit = Math.round((p < 1 ? p : 2 - p) * vn);
+          col = i < lit ? pc(i / vn) : c2;
+        } else if (fx === "Chase") {
+          const gap = Math.max(2, 6 - Math.floor(inten / 52)), off = Math.floor(ph * 8);
+          col = (i + off) % gap === 0 ? pc(i / vn + fr * 0.5) : c2;
+        } else if (fx === "Scan") {
+          const t = ((ph * 0.5) % 1) * 2, p = t < 1 ? t : 2 - t, sz = 1 + (inten / 255) * (vn / 6 + 2);
+          col = ledBlend(c2, pc(p), 1 - Math.abs(i - p * (vn - 1)) / sz);
+        } else if (fx === "Twinkle" || fx === "TwinkleFox" || fx === "TwinkleCat") {
+          const dens = fx === "Twinkle" ? (0.2 + 0.6 * (inten / 255)) : (0.22 + 0.72 * (inten / 255));
+          const hk = ledHash(i * 131 + 29);
+          if (hk > dens) col = c2;
+          else {
+            const fq = 0.55 + ledHash(i * 47 + 11) * 1.1, po = ledHash(i * 71 + 23);
+            const tu = (ph * fq + po) % 1;
+            const amp = fx === "TwinkleCat"
+              ? (tu < 0.12 ? tu / 0.12 : Math.pow(1 - (tu - 0.12) / 0.88, 2.4))
+              : Math.max(0, Math.pow(Math.sin(6.283 * tu), 3));
+            const base = pal === 0 ? c1 : pc((fx === "TwinkleCat" ? fr * 0.35 : 0) + ledHash(i * 19 + 5));
+            col = ledBlend(c2, base, amp);
+          }
+        } else if (fx === "Fire") {
+          const fl = 0.4 + 0.6 * Math.abs(Math.sin(ph * 5.3 + i * 0.7)) * Math.max(0.15, 1 - u * 0.85);
+          const hn = Math.min(1, fl * (0.6 + 0.4 * (inten / 255)));
+          col = pal === 0 ? { r: Math.min(255, hn * 380), g: Math.max(0, (hn - 0.35) * 320), b: Math.max(0, (hn - 0.75) * 400) } : ledScale(pc(hn), hn * 1.35);
+        } else if (fx === "Meteor") {
+          const head = (ph * 4) % (vn + 6), dist = head - i;
+          const tail = dist >= 0 && dist < 8 ? Math.pow(1 - dist / 8, 1.8) : 0;
+          col = ledScale(pc(i / vn), tail);
+        } else if (fx === "Strobe") {
+          col = (ph * 4) % 1 < (0.05 + 0.3 * (inten / 255)) ? pc(ph * 0.5) : c2;
+        } else if (fx === "Color Cycle") {
+          col = pal === 0 ? ledHsv(fr, 1, 1) : pc(fr);
+        } else if (fx === "Theater Rainbow") {
+          const off = Math.floor(ph * 6), t = fr + i / vn;
+          col = (i + off) % 3 === 0 ? (pal === 0 ? ledHsv(t, 1, 1) : pc(t)) : c2;
+        } else if (fx === "Running Lights") {
+          const wv = 1 + Math.floor(inten / 64);
+          col = ledBlend(c2, pc(i / vn + fr * 0.3), (Math.sin(6.283 * ((wv * i) / vn - ph)) + 1) * 0.5);
+        } else if (fx === "Sparkle") {
+          const sp = ((Math.floor(ph * 18) * 37 + i * 17) % 19) === 0 ? 1 : 0;
+          col = ledBlend(ledScale(pc(i / vn), 0.22), c3, sp);
+        } else if (fx === "Plasma") {
+          const t = ph * 6.283, spr = 0.15 + 0.35 * (inten / 255);
+          const pv = (Math.sin(i * 0.15 + t) + Math.sin(i * 0.07 - t * 1.3) + Math.sin(i * 0.11 + t * 0.7)) / 3;
+          col = pal === 0 ? ledHsv(0.6 + pv * spr, 1, 1) : pc(0.5 + pv * spr * 1.6 + fr * 0.25);
+        } else if (fx === "Confetti" || fx === "Fireworks") {
+          const tick = Math.floor(ph * 8), h1 = ledHash(i * 31 + tick * 97);
+          const on = h1 > (0.78 - 0.3 * (inten / 255));
+          col = on ? (pal === 0 ? ledHsv(ledHash(i + tick * 13), 1, 1) : pc(ledHash(i + tick * 13))) : c2;
+        } else if (fx === "Lightning") {
+          const tick = Math.floor(ph * 10), trig = ledHash(tick * 13) > 0.86;
+          col = trig && i > vn * 0.2 && i < vn * 0.75 ? pc(0.85) : c2;
+        } else if (fx === "Candle") {
+          const fl = 0.65 + 0.35 * Math.sin(ph * 9 + i * 0.9) * Math.cos(ph * 4.3);
+          col = ledScale(pc(0.5 + (i / vn) * 0.3), fl);
+        } else if (fx === "Police") {
+          const f = (ph * 2) % 1, left = f < 0.5, on = ((f * 6) % 1) < 0.6, lh = i < vn / 2;
+          col = on && lh === left ? (left ? { r: 255, g: 0, b: 0 } : { r: 0, g: 0, b: 255 }) : { r: 0, g: 0, b: 0 };
+        } else if (fx === "Heartbeat") {
+          const f = (ph * 0.5) % 1, a = (f - 0.12) / 0.05, b = (f - 0.32) / 0.06;
+          col = ledBlend(c2, pc(i / vn), Math.min(1, Math.exp(-a * a) + 0.6 * Math.exp(-b * b)));
+        } else if (fx === "Juggle") {
+          col = { r: 0, g: 0, b: 0 };
+          const dots = 3 + Math.floor(inten / 64);
+          for (let k = 0; k < dots; k++) {
+            const pos = Math.round(((Math.sin(6.283 * ph * (0.35 + 0.21 * k) + k * 1.3) + 1) * 0.5) * (vn - 1));
+            if (pos === i) col = ledAddSat(col, pal === 0 ? ledHsv(k / dots, 1, 1) : pc(k / dots));
+          }
+        } else if (fx === "Gradient") {
+          const wv = 0.5 - 0.5 * Math.cos(6.283 * (i / vn + fr));
+          col = pal === 0 ? ledBlend(c1, ledScale(c1, 0.25), wv) : pc(wv);
+        } else if (fx === "Noise") {
+          const nv = 0.5 + 0.5 * Math.sin(i * (0.15 + 0.25 * (inten / 255)) + ph * 3) * Math.cos(i * 0.13 - ph * 1.7);
+          col = pal === 0 ? ledScale(c1, nv) : pc(nv);
+        } else if (fx === "Sinelon") {
+          const pos = ((Math.sin(ph * 3.1416) + 1) * 0.5) * (vn - 1);
+          const d = Math.abs(i - pos);
+          col = d < 3 ? ledScale(pc(fr), Math.max(0, 1 - d / 3)) : c2;
+        } else if (fx === "Bouncing Balls") {
+          col = c2;
+          const balls = 1 + Math.floor((inten / 255) * 4);
+          for (let b = 0; b < balls; b++) {
+            const bf = (ph * (0.65 + 0.14 * b) + b * 0.27) % 1, bu = 1 - Math.abs(2 * bf - 1);
+            const idx = Math.round((1 - (1 - bu) * (1 - bu)) * (vn - 1));
+            if (idx === i) col = ledAddSat(col, pal === 0 ? ledHsv(b / balls, 1, 1) : pc(balls > 1 ? b / (balls - 1) : 0));
+          }
+        } else if (fx === "Pacifica") {
+          const t = ph * 1.4, sf = 0.6 + (inten / 255) * 1.2;
+          const crest = Math.pow(((Math.sin(i * 0.18 + t * 1.1) + 1) * 0.225) + ((Math.sin(i * 0.29 - t * 0.85 * sf) + 1) * 0.175) + ((Math.sin(i * 0.43 + t * 1.7) + 1) * 0.1), 1.5);
+          col = pal === 0 ? ledBlend({ r: 2, g: 16, b: 48 }, { r: 165, g: 245, b: 255 }, crest) : pc(crest);
+        } else if (fx === "Colorwaves") {
+          const wv = 1.5 + (inten / 255) * 3.5;
+          const t = 0.5 + 0.32 * Math.sin(u * 6.283 * wv + ph * 2.2) + 0.18 * Math.sin(u * 6.283 * wv * 0.6 - ph * 1.3) + fr;
+          col = pal === 0 ? ledHsv(t, 0.9, 1) : pc(t);
+        } else {
+          col = pal === 0 ? c1 : pc(u);
+        }
+        vpx[i] = col;
+      }
+      if (v.mirror && vn > 1) {
+        const half = Math.floor((vn + 1) / 2);
+        for (let i = 0; i < half; i++) vpx[vn - 1 - i] = vpx[i];
+      }
+      if (v.reverse && vn > 1) vpx.reverse();
+      const ppx = new Array(physN);
+      for (let i = 0; i < physN; i++) {
+        const vi = Math.floor(i / str), pg = i % str;
+        ppx[i] = pg < grp && vi < vn ? vpx[vi] : c2;
+      }
+      let off = ((v.offset || 0) % physN + physN) % physN;
+      for (let i = 0; i < physN; i++) {
+        const src = ppx[(i - off + physN) % physN];
+        ctx.fillStyle = "rgb(" + Math.round(src.r * bri) + "," + Math.round(src.g * bri) + "," + Math.round(src.b * bri) + ")";
+        ctx.beginPath();
+        ctx.arc((i + 0.5) * cell, h / 2, Math.max(2, cell * 0.36), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+  ledPeekRaf = requestAnimationFrame(ledPeekTick);
+}
+function ledTile() {
+  const led = config.ledStrip;
+  if (!led) return "";
+  const on = ledState ? !!ledState.on : false;
+  ledOn = on;
+  const col = on && ledState ? ' style="color:' + ledHex(ledState.color) + '"' : "";
+  return '<div class="tile-wrap"><button type="button" class="tile tap' + (on ? " on" : "") +
+    '" data-led-toggle="1" aria-pressed="' + on + '" aria-label="' + tileAction(on) + " " + esc(led.name) + '">' +
+    '<span class="tile-top"' + col + ">" + LED_ICON + "</span><b>" + esc(led.name) + "</b>" +
+    '<span class="tile-sub">' + tileAction(on) + "</span>" +
+    '<span class="tile-pins">GPIO' + esc(led.pin) + " · " + esc(led.leds) + " LEDs</span></button>" +
+    '<button type="button" class="cog" data-led-cog="1" title="Configurar" aria-label="Configurar ' +
+    esc(led.name) + '">' + COG + "</button></div>";
+}
+function ledSync() {
+  if (!config.ledStrip) { ledCloseModal(); ledState = null; return; }
+  if (!ledState) ledGet();
+}
+function ledTileUpdate() {
+  const t = document.querySelector("[data-led-toggle]");
+  if (!t) return;
+  setToggleTileState(t, ledOn);
+  const top = t.querySelector(".tile-top");
+  if (top) top.style.color = ledOn && ledState ? ledHex(ledState.color) : "";
+  const meta = t.querySelector(".tile-pins");
+  if (meta && ledState) meta.textContent = "GPIO" + ledState.pin + " · " + ledState.leds + " LEDs";
+}
+function ledPower(on) {
+  ledOn = on;
+  if (ledState) ledState.on = on;
+  ledTileUpdate();
+}
+function ledFill(s) {
+  if (!$("led-modal") || !s.segs) return;
+  if (ledSeg >= s.segs.length) ledSeg = -1;
+  const sig = s.segs.map((g) => g.start + "-" + g.stop).join(",") + "|" + s.leds + "|" + ledSeg;
+  if (sig !== ledSig || !$("led-segs").children.length) {
+    ledSig = sig;
+    $("led-seg").innerHTML = '<option value="-1">Todos os segmentos</option>' +
+      s.segs.map((g, i) => '<option value="' + i + '">Segmento ' + (i + 1) + " (" + g.start + "–" + g.stop + ")</option>").join("");
+    $("led-seg").value = ledSeg;
+    $("led-segs").innerHTML = s.segs.map((g, i) =>
+      '<div class="led-segrow"><b>' + (i + 1) + "</b>" +
+      '<input type="number" min="0" max="' + (s.leds - 1) + '" data-led-seg="' + i + '" data-f="start" value="' + g.start + '">' +
+      '<input type="number" min="0" max="' + (s.leds - 1) + '" data-led-seg="' + i + '" data-f="stop" value="' + g.stop + '">' +
+      (s.segs.length > 1 ? '<button type="button" class="modal-x" data-led-segdel="' + i + '" aria-label="Remover segmento ' + (i + 1) + '">×</button>' : "<span></span>") +
+      "</div>").join("");
+  }
+  const v = ledView();
+  $("led-co").value = ledHex(v.color);
+  if ($("led-c2")) $("led-c2").value = ledHex(v.color2);
+  if ($("led-c3")) $("led-c3").value = ledHex(v.color3);
+  $("led-br").value = v.brightness; $("led-bv").textContent = v.brightness;
+  $("led-fx").value = v.effect;
+  if (s.customPalettes && Array.isArray(s.customPalettes)) {
+    s.customPalettes.forEach((stops, slot) => {
+      if (Array.isArray(stops) && stops.length >= 2) {
+        LED_PALETTE_GRADIENTS[LED_CUSTOM_START + slot] = stops
+          .map((st) => ledHex(st) + " " + Math.round(((st.pos || 0) / 255) * 100) + "%")
+          .join(", ");
+        delete LED_PAL_CACHE[LED_CUSTOM_START + slot];
+      }
+    });
+  }
+  if ($("led-pal")) {
+    $("led-pal").value = v.palette;
+    ledUpdatePalettePreview(v.palette, v.color, v.color2, v.color3);
+  }
+  if ($("led-pr") && s.presets) {
+    $("led-pr").innerHTML = '<option value="0">Nenhum</option>' +
+      s.presets.map((p) => '<option value="' + p.slot + '">' + p.slot + ": " + esc(p.name) + (p.occ ? "" : " (vazio)") + "</option>").join("");
+    $("led-pr").value = s.preset || 0;
+  }
+  if ($("led-bp") && s.presets) {
+    $("led-bp").innerHTML = '<option value="0">Último estado</option>' +
+      s.presets.map((p) => '<option value="' + p.slot + '">Preset ' + p.slot + ": " + esc(p.name) + "</option>").join("");
+    $("led-bp").value = s.bootPreset || 0;
+  }
+  if ($("led-pat") && s.patterns) {
+    const curOpts = $("led-pat").options.length;
+    if (curOpts !== s.patterns.length + 1) {
+      $("led-pat").innerHTML = '<option value="Nenhum">Nenhum (Manual)</option>' +
+        s.patterns.map((p) => '<option value="' + esc(p) + '">' + esc(p) + "</option>").join("");
+    }
+    $("led-pat").value = s.pattern || "Nenhum";
+  }
+  if ($("led-rev")) $("led-rev").checked = v.reverse;
+  if ($("led-mir")) $("led-mir").checked = v.mirror;
+  if ($("led-grp") && document.activeElement !== $("led-grp")) $("led-grp").value = v.grouping;
+  if ($("led-spc") && document.activeElement !== $("led-spc")) $("led-spc").value = v.spacing;
+  if ($("led-off") && document.activeElement !== $("led-off")) $("led-off").value = v.offset;
+  if ($("led-nlmin") && s.nightlight && document.activeElement !== $("led-nlmin")) $("led-nlmin").value = s.nightlight.min || 15;
+  if ($("led-nlbtn") && s.nightlight) {
+    $("led-nlbtn").textContent = s.nightlight.on
+      ? "Parar (" + Math.ceil((s.nightlight.remSec || 0) / 60) + "m)"
+      : "Ativar Temporizador";
+  }
+  $("led-sp").value = v.speed; $("led-it").value = v.intensity;
+  if (document.activeElement !== $("led-nl")) $("led-nl").value = s.leds;
+  if (document.activeElement !== $("led-tr")) $("led-tr").value = s.transition;
+  if (document.activeElement !== $("led-lm")) $("led-lm").value = s.limit ? (s.limit / 1000).toString() : "";
+  if (document.activeElement !== $("led-lp")) $("led-lp").value = s.maPerLed;
+  $("led-ord").value = s.colorOrder; $("led-gm").value = s.gamma;
+  ["cr", "cg", "cb"].forEach((k, i) => {
+    if (document.activeElement !== $("led-" + k)) $("led-" + k).value = s.cal[i];
+    $("led-" + k + "v").textContent = s.cal[i] + "%";
+  });
+  const amps = (s.ma / 1000).toFixed(2).replace(".", ",");
+  $("led-ma").textContent = "Consumo estimado agora: " + amps + " A" +
+    (s.limit ? " (limite " + (s.limit / 1000).toString().replace(".", ",") + " A" + (s.limited ? " — a reduzir o brilho para o respeitar" : "") + ")" : " (sem limite definido)");
+  const t = ledTarget();
+  $("led-segpw-box").classList.toggle("hide", t < 0);
+  if (t >= 0) $("led-segpw").textContent = s.segs[t].on ? "Desligar este segmento" : "Ligar este segmento";
+  $("led-info").textContent = "GPIO" + s.pin + " · " + s.leds + " LEDs · " + s.segs.length + (s.segs.length === 1 ? " segmento" : " segmentos");
+  $("led-msg").textContent = "";
+}
+function ledShow(s, all, force) {
+  if (force || Date.now() - ledBusy > 1200) { ledState = s; ledOn = !!s.on; } else if (ledState) { ledState.pin = s.pin; ledState.leds = s.leds; }
+  ledTileUpdate();
+  if (all) ledFill(s);
+}
+async function ledGet() {
+  try { ledShow(await api("/ledstate"), Date.now() - ledBusy > 1500, false); }
+  catch (e) { const m = $("led-msg"); if (m) m.textContent = "Sem resposta da fita."; }
+}
+function ledSend(o, now) {
+  clearTimeout(ledTimer);
+  ledBusy = Date.now();
+  if (o.state && o.seg === undefined) ledPower(o.state === "ON");
+  const go = async () => {
+    try {
+      ledShow(await api("/led/set", { method: "POST", body: JSON.stringify(o) }), false, true);
+      if (o.segments || o.leds !== undefined || o.limit !== undefined || o.maPerLed !== undefined ||
+          o.pattern !== undefined || o.preset !== undefined || o.savePreset !== undefined || o.nightlight !== undefined) {
+        setTimeout(() => { ledBusy = 0; ledGet(); }, 350);
+      }
+    }
+    catch (e) {
+      const m = $("led-msg");
+      if (m) m.textContent = e && e.status === 409 ? "A fita ainda está a arrancar — tenta daqui a uns segundos." : "Não foi possível comandar a fita.";
+    }
+  };
+  if (now) go(); else ledTimer = setTimeout(go, 90);
+}
+function ledSendT(o, now) {
+  const t = ledTarget();
+  if (t >= 0) o.seg = t;
+  ledSend(o, now);
+}
+function ledSendSegments(list) { ledSend({ segments: list }, true); }
+function ledSegList() {
+  const out = [];
+  document.querySelectorAll("#led-segs [data-led-seg]").forEach((el) => {
+    const i = +el.dataset.ledSeg;
+    out[i] = out[i] || {};
+    out[i][el.dataset.f] = parseInt(el.value, 10) || 0;
+  });
+  return out;
+}
+function ledOpenModal() {
+  if ($("led-modal") || !config.ledStrip) return;
+  const bg = document.createElement("div");
+  bg.className = "modal-bg";
+  bg.id = "led-modal";
+  bg.innerHTML =
+    '<div class="modal" role="dialog" aria-modal="true" aria-label="' + esc(config.ledStrip.name) + '">' +
+    '<div class="modal-head"><b>' + esc(config.ledStrip.name) + '</b>' +
+    '<button type="button" class="modal-x" data-led-close="1" aria-label="Fechar">×</button></div>' +
+    '<canvas id="led-peek" width="380" height="26" style="width:100%;height:26px;border-radius:8px;border:1px solid rgba(128,128,128,.25);margin-bottom:10px;display:block"></canvas>' +
+    '<div class="field"><label>PRESET WLED (GUARDAR / CARREGAR)</label>' +
+    '<div class="row2" style="grid-template-columns:1fr auto;gap:6px;align-items:center">' +
+    '<select id="led-pr"><option value="0">Nenhum</option></select>' +
+    '<button type="button" class="btn" data-led-savepreset="1">Guardar aqui</button></div></div>' +
+    '<div class="field"><label>SEGMENTO</label><select id="led-seg"><option value="-1">Todos os segmentos</option></select></div>' +
+    '<div class="field hide" id="led-segpw-box"><button type="button" class="btn" id="led-segpw" data-led-segpw="1"></button></div>' +
+    '<div class="row2" style="grid-template-columns:1fr 1fr 1fr;gap:8px">' +
+    '<div class="field"><label>COR 1</label><input type="color" id="led-co" value="#ffa03c"></div>' +
+    '<div class="field"><label>COR 2 (FUNDO)</label><input type="color" id="led-c2" value="#000000"></div>' +
+    '<div class="field"><label>COR 3 (REALCE)</label><input type="color" id="led-c3" value="#ffffff"></div></div>' +
+    '<div class="field"><label>PALETE DE CORES (WLED)</label><select id="led-pal">' +
+    LED_PALETTES.map((p, idx) => '<option value="' + idx + '">' + esc(p) + "</option>").join("") + "</select>" +
+    '<div id="led-pal-preview" style="height:8px;border-radius:4px;margin-top:6px;border:1px solid rgba(128,128,128,.25)"></div></div>' +
+    '<div class="field"><label>PADRÃO DINÂMICO</label><select id="led-pat"><option value="Nenhum">Nenhum (Manual)</option></select></div>' +
+    '<div class="field"><label>BRILHO <span id="led-bv"></span></label><input type="range" id="led-br" min="1" max="255"></div>' +
+    '<div class="field"><label>EFEITO (31 WLED)</label><select id="led-fx">' +
+    LED_EFFECTS.map((e) => '<option value="' + e[0] + '">' + e[1] + "</option>").join("") + "</select></div>" +
+    '<div class="row2"><div class="field"><label>VELOCIDADE</label><input type="range" id="led-sp" min="0" max="255"></div>' +
+    '<div class="field"><label>INTENSIDADE</label><input type="range" id="led-it" min="0" max="255"></div></div>' +
+    '<div class="row2" style="margin-bottom:10px">' +
+    '<label class="f-check"><input type="checkbox" id="led-rev"> Inverter direção</label>' +
+    '<label class="f-check"><input type="checkbox" id="led-mir"> Espelho simétrico</label></div>' +
+    '<div class="row2" style="grid-template-columns:1fr 1fr 1fr;gap:8px">' +
+    '<div class="field"><label>GROUPING</label><input type="number" id="led-grp" min="1" max="16" value="1"></div>' +
+    '<div class="field"><label>SPACING</label><input type="number" id="led-spc" min="0" max="15" value="0"></div>' +
+    '<div class="field"><label>OFFSET</label><input type="number" id="led-off" min="-300" max="300" value="0"></div></div>' +
+    '<div class="field"><label>TEMPORIZADOR NIGHTLIGHT (MINUTOS)</label>' +
+    '<div class="row2" style="grid-template-columns:1fr auto;gap:6px;align-items:center">' +
+    '<input type="number" id="led-nlmin" min="1" max="120" value="15">' +
+    '<button type="button" class="btn" id="led-nlbtn" data-led-nl="1">Ativar Temporizador</button></div></div>' +
+    '<div class="field"><label>ARRANQUE AUTOMÁTICO (BOOT PRESET)</label><select id="led-bp"><option value="0">Último estado</option></select></div>' +
+    '<div class="field"><label>PERSONALIZAR PALETE (SLOTS CUSTOM — 3 CORES)</label>' +
+    '<div class="row2" style="grid-template-columns:auto 1fr 1fr 1fr auto;gap:6px;align-items:center">' +
+    '<select id="led-cslot" style="padding:8px 6px">' +
+    Array.from({ length: LED_CUSTOM_COUNT }, (_, i) => '<option value="' + i + '">Custom ' + (i + 1) + '</option>').join("") + '</select>' +
+    '<input type="color" id="led-c1a" value="#97d700"><input type="color" id="led-c1b" value="#00d2ff"><input type="color" id="led-c1c" value="#1e293b">' +
+    '<button type="button" class="btn" data-led-savepal="1">Aplicar</button></div></div>' +
+    '<div class="field"><label>NÚMERO DE LEDS</label><input type="number" id="led-nl" min="1" max="600"></div>' +
+    '<div class="row2"><div class="field"><label>TRANSIÇÃO (ms)</label><input type="number" id="led-tr" min="0" max="3000" step="50"></div>' +
+    '<div class="field"><label>LIMITE DA FONTE (A)</label><input type="number" id="led-lm" min="0" max="20" step="0.1" placeholder="0 = sem limite"></div></div>' +
+    '<div class="field"><label>CONSUMO DE 1 LED A BRANCO (mA)</label><input type="number" id="led-lp" min="10" max="100"></div>' +
+    '<div class="note" id="led-ma"></div>' +
+    '<div class="field"><label>AJUSTE DE CORES</label>' +
+    '<p class="note" style="margin:0 0 8px">Se o vermelho sair rosado ou a cor não coincidir: liga a correção gama (2,2) e baixa um pouco o verde e o azul. Se o vermelho sair verde ou azul, muda a ordem das cores.</p>' +
+    '<div class="row2"><div class="field"><label>ORDEM DAS CORES</label><select id="led-ord">' +
+    ["GRB (normal)", "RGB", "BRG", "RBG", "GBR", "BGR"].map((n, i) => '<option value="' + i + '">' + n + "</option>").join("") + "</select></div>" +
+    '<div class="field"><label>CORREÇÃO GAMA</label><select id="led-gm"><option value="10">Sem correção</option><option value="22">2,2</option><option value="28">2,8</option></select></div></div>' +
+    '<div class="field"><label>VERMELHO <span id="led-crv"></span></label><input type="range" id="led-cr" min="10" max="100"></div>' +
+    '<div class="field"><label>VERDE <span id="led-cgv"></span></label><input type="range" id="led-cg" min="10" max="100"></div>' +
+    '<div class="field"><label>AZUL <span id="led-cbv"></span></label><input type="range" id="led-cb" min="10" max="100"></div></div>' +
+    '<div class="field"><label>SEGMENTOS (LED inicial / final)</label><div id="led-segs"></div>' +
+    '<button type="button" class="btn" data-led-segadd="1" style="margin-top:8px">+ Dividir (novo segmento)</button></div>' +
+    '<div class="field"><button type="button" class="btn" data-led-test="1">Testar fita (vermelho, verde, azul)</button></div>' +
+    '<div class="note" id="led-info"></div><div class="note err" id="led-msg"></div></div>';
+  document.body.appendChild(bg);
+  ledSig = "";
+  if (!ledPeekRaf) ledPeekRaf = requestAnimationFrame(ledPeekTick);
+  if (ledState) ledFill(ledState); else ledGet();
+}
+function ledCloseModal() {
+  const m = $("led-modal");
+  if (m) m.remove();
+  if (ledPeekRaf) { cancelAnimationFrame(ledPeekRaf); ledPeekRaf = 0; }
+  ledSig = "";
+}
+document.addEventListener("click", (ev) => {
+  if (ev.target.closest("[data-led-cog]")) { ledOpenModal(); return; }
+  if (ev.target.closest("[data-led-close]") || ev.target.id === "led-modal") { ledCloseModal(); return; }
+  if (ev.target.closest("[data-led-test]")) { ledSend({ test: true }, true); return; }
+  if (ev.target.closest("[data-led-savepreset]")) {
+    const cur = $("led-pr") ? (+$("led-pr").value || 1) : 1;
+    const slot = cur >= 1 && cur <= 8 ? cur : 1;
+    ledSend({ savePreset: slot }, true);
+    return;
+  }
+  if (ev.target.closest("[data-led-nl]")) {
+    const active = ledState && ledState.nightlight && ledState.nightlight.on;
+    const mins = $("led-nlmin") ? (+$("led-nlmin").value || 15) : 15;
+    ledSend({ nightlight: { on: !active, min: mins } }, true);
+    return;
+  }
+  if (ev.target.closest("[data-led-savepal]")) {
+    const slot = $("led-cslot") ? (+$("led-cslot").value || 0) : 0;
+    const palId = LED_CUSTOM_START + slot;
+    const a = ledRgb($("led-c1a").value), b = ledRgb($("led-c1b").value), c = ledRgb($("led-c1c").value);
+    const gA = $("led-c1a").value, gB = $("led-c1b").value, gC = $("led-c1c").value;
+    LED_PALETTE_GRADIENTS[palId] = gA + " 0%, " + gB + " 50%, " + gC + " 100%";
+    delete LED_PAL_CACHE[palId];
+    ledSend({ state: "ON", customPalette: { slot: slot, stops: [{ pos: 0, ...a }, { pos: 128, ...b }, { pos: 255, ...c }] }, palette: palId }, true);
+    if ($("led-pal")) $("led-pal").value = palId;
+    ledUpdatePalettePreview(palId);
+    return;
+  }
+  if (ev.target.closest("[data-led-segpw]")) {
+    const t = ledTarget();
+    if (t >= 0) ledSend({ seg: t, state: ledState.segs[t].on ? "OFF" : "ON" }, true);
+    return;
+  }
+  const segDel = ev.target.closest("[data-led-segdel]");
+  if (segDel) {
+    const list = ledState.segs.map((g) => ({ start: g.start, stop: g.stop }));
+    const i = +segDel.dataset.ledSegdel;
+    if (i > 0) list[i - 1].stop = list[i].stop; else list[1].start = list[0].start;
+    list.splice(i, 1);
+    ledSeg = -1;
+    ledSendSegments(list);
+    return;
+  }
+  if (ev.target.closest("[data-led-segadd]")) {
+    const list = ledState.segs.map((g) => ({ start: g.start, stop: g.stop }));
+    if (list.length >= 8) { $("led-msg").textContent = "No máximo 8 segmentos."; return; }
+    let k = 0;
+    list.forEach((g, i) => { if (g.stop - g.start > list[k].stop - list[k].start) k = i; });
+    const g = list[k];
+    if (g.stop - g.start < 1) { $("led-msg").textContent = "Já não há LEDs para dividir."; return; }
+    const mid = g.start + Math.floor((g.stop - g.start) / 2);
+    list.splice(k + 1, 0, { start: mid + 1, stop: g.stop });
+    g.stop = mid;
+    ledSendSegments(list);
+    return;
+  }
+  if (ev.target.closest("[data-led-toggle]")) ledSend({ state: ledOn ? "OFF" : "ON" }, true);
+});
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") ledCloseModal(); });
+document.addEventListener("input", (ev) => {
+  const id = ev.target.id;
+  if (id === "led-co") ledSendT({ state: "ON", color: ledRgb(ev.target.value) });
+  else if (id === "led-c2") ledSendT({ color2: ledRgb(ev.target.value) });
+  else if (id === "led-c3") ledSendT({ color3: ledRgb(ev.target.value) });
+  else if (id === "led-br") { $("led-bv").textContent = ev.target.value; ledSendT({ brightness: +ev.target.value }); }
+  else if (id === "led-sp") ledSendT({ speed: +ev.target.value });
+  else if (id === "led-it") ledSendT({ intensity: +ev.target.value });
+  else if (id === "led-cr" || id === "led-cg" || id === "led-cb") {
+    const cal = ["led-cr", "led-cg", "led-cb"].map((k) => +$(k).value);
+    $(id + "v").textContent = ev.target.value + "%";
+    ledSend({ cal: cal });
+  }
+});
+document.addEventListener("change", (ev) => {
+  if (ev.target.dataset && ev.target.dataset.ledKnx) {
+    const v = (k) => parseInt(document.querySelector('[data-led-knx="' + k + '"]').value, 10) || 0;
+    const knx = { area: v("area"), line: v("line"), member: v("member") };
+    api("/led/set", { method: "POST", body: JSON.stringify({ knx: knx }) })
+      .then(() => { Object.assign(config.ledStrip, knx); toast("KNX guardado", "ok"); })
+      .catch(() => toast("Não foi possível guardar o KNX", "err"));
+    return;
+  }
+  const id = ev.target.id;
+  if (id === "led-fx") ledSendT({ state: "ON", effect: ev.target.value }, true);
+  else if (id === "led-pal") {
+    const vw = ledState && ledState.segs ? ledView() : {};
+    ledUpdatePalettePreview(ev.target.value, vw.color, vw.color2, vw.color3);
+    ledSendT({ state: "ON", palette: +ev.target.value }, true);
+  }
+  else if (id === "led-pr") { const s = +ev.target.value; if (s > 0) ledSend({ preset: s }, true); }
+  else if (id === "led-bp") ledSend({ bootPreset: +ev.target.value }, true);
+  else if (id === "led-pat") ledSend({ state: "ON", pattern: ev.target.value }, true);
+  else if (id === "led-rev") ledSendT({ reverse: ev.target.checked }, true);
+  else if (id === "led-mir") ledSendT({ mirror: ev.target.checked }, true);
+  else if (id === "led-grp") ledSendT({ grouping: Math.max(1, Math.min(16, +ev.target.value || 1)) }, true);
+  else if (id === "led-spc") ledSendT({ spacing: Math.max(0, Math.min(15, +ev.target.value || 0)) }, true);
+  else if (id === "led-off") ledSendT({ offset: Math.max(-300, Math.min(300, +ev.target.value || 0)) }, true);
+  else if (id === "led-nl") ledSend({ leds: +ev.target.value }, true);
+  else if (id === "led-ord") ledSend({ colorOrder: +ev.target.value }, true);
+  else if (id === "led-gm") ledSend({ gamma: +ev.target.value }, true);
+  else if (id === "led-tr") ledSend({ transition: Math.max(0, Math.min(3000, parseInt(ev.target.value, 10) || 0)) }, true);
+  else if (id === "led-lm") ledSend({ limit: Math.round((parseFloat(String(ev.target.value).replace(",", ".")) || 0) * 1000) }, true);
+  else if (id === "led-lp") ledSend({ maPerLed: parseInt(ev.target.value, 10) || 60 }, true);
+  else if (id === "led-seg") { ledSeg = parseInt(ev.target.value, 10); ledSig = ""; if (ledState) ledFill(ledState); }
+  else if (ev.target.dataset && ev.target.dataset.ledSeg !== undefined) ledSendSegments(ledSegList());
+});
+setInterval(() => {
+  if (typeof config !== "undefined" && config && config.ledStrip && !document.hidden &&
+      Date.now() - ledBusy > 1500) ledGet();
+}, 3000);
+const ENERGY_DRIVERS = ["HAN_MODBUS", "HAN_MODBUS_8N2", "PZEM_004T_V03", "PZEM_004T_V01"];
+const isEnergy = (f) => ENERGY_DRIVERS.indexOf(f.driver) >= 0;
+
+const ENERGY_FIELDS = [
+  { k: "voltage", n: "tensão", u: " V", d: 1 },
+  { k: "current", n: "corrente", u: " A", d: 2 },
+  { k: "powerFactor", n: "fator de potência", u: "", d: 2 },
+  { k: "frequency", n: "frequência", u: " Hz", d: 1 },
+  { k: "energy", n: "energia", u: " kWh", d: 2 },
+  { k: "powerImport", n: "importado", u: " kWh", d: 1 },
+  { k: "powerExport", n: "exportado", u: " kWh", d: 1 },
+  { k: "rate1", n: "vazio", u: " kWh", d: 1 },
+  { k: "rate2", n: "cheias", u: " kWh", d: 1 },
+  { k: "rate3", n: "ponta", u: " kWh", d: 1 },
+];
+const TARIFF = { 1: "vazio", 2: "cheias", 3: "ponta" };
+
+function parseState(state) {
+  if (state == null || state === "") return null;
+  let o = state;
+  if (typeof o === "string") { try { o = JSON.parse(o); } catch (e) { return null; } }
+  return typeof o === "object" ? o : null;
+}
+
+/* Importing reads positive; exporting to the grid reads negative and green. */
+/* A meter reads as three things at once — what it draws, what it returns, and
+   which period it is billing — so the card leads with those instead of burying
+   them in a list. Import and export sit either side of the meter's own health,
+   the tariff periods carry a traffic light against the contracted power, and the
+   raw instantaneous values follow for whoever wants them. */
+const TARIFF_PERIODS = [
+  { k: "rate1", n: "Vazio", t: 1 },
+  { k: "rate2", n: "Cheias", t: 2 },
+  { k: "rate3", n: "Ponta", t: 3 },
+];
+const ADVANCED_FIELDS = [
+  { k: "power", n: "potência", u: " W", d: 0 },
+  { k: "voltage", n: "tensão", u: " V", d: 1 },
+  { k: "current", n: "corrente", u: " A", d: 2 },
+  { k: "frequency", n: "frequência", u: " Hz", d: 1 },
+  { k: "powerFactor", n: "fator de potência", u: "", d: 3 },
+  { k: "energy", n: "energia", u: " kWh", d: 2 },
+];
+const TOTALS_FIELDS = [
+  { k: "powerImport", n: "energia importada", u: " kWh", d: 2 },
+  { k: "powerExport", n: "energia exportada", u: " kWh", d: 2 },
+];
+
+function metric(value, unit, label, cls) {
+  return '<div class="metric ' + (cls || "") + '">' +
+    '<b>' + esc(value) + '<small>' + unit + "</small></b>" +
+    '<span>' + esc(label) + "</span></div>";
+}
+function fieldRows(o, fields) {
+  return fields.filter((x) => o[x.k] != null).map((x) =>
+    '<div class="kv"><span>' + x.n + "</span><b>" +
+    Number(o[x.k]).toFixed(x.d) + x.u + "</b></div>").join("");
+}
+
+function energyCard(f) {
+  const o = parseState(f.state) || {};
+  const imp = Number(o.power || 0);
+  const exp = Number(o.export || 0);
+  const exporting = exp > 0 && imp <= 0;
+  const bad = o.status && o.status !== "HAN OK" ? o.status : (o.error ? "erro de leitura" : "");
+
+  // Headline: drawn, health, returned. The live value the SSE handler tracks is
+  // whichever direction is active.
+  const head = '<div class="metrics">' +
+    metric(Math.round(imp), "W", "importado", imp > 0 ? "hot" : "") +
+    '<div class="metric health">' +
+      '<b class="' + (bad ? "red" : "grn") + '">' + (bad ? "!" : "OK") + "</b>" +
+      '<span>' + esc(bad || "medidor") + "</span></div>" +
+    metric(Math.round(exp), "W", "exportado", exporting ? "grn" : "") +
+    "</div>";
+
+  const periods = TARIFF_PERIODS.filter((p) => o[p.k] != null);
+  // Contracted power beside the real reading, as the meter's own panel shows it:
+  // the pair only means something read together.
+  const contracted = o.demandControlT1 != null || o.demandControlT2 != null || o.demandControlT3 != null;
+  const periodBlock = periods.length
+    ? '<div class="sub">Contrato e leituras</div>' +
+      '<div class="period head"><i></i><span></span>' +
+      (contracted ? "<em>contratado</em>" : "") + "<b>consumo real</b></div>" +
+      periods.map((p) => {
+        const limit = o["demandControlT" + p.t];
+        return '<div class="period' + (o.tarif === p.t ? " now" : "") + '">' +
+          '<i></i><span>' + p.n + "</span>" +
+          (contracted ? "<em>" + (limit != null ? Number(limit).toFixed(1) + " kVA" : "—") + "</em>" : "") +
+          '<b>' + Number(o[p.k]).toFixed(3) + "<small> kWh</small></b></div>";
+      }).join("")
+    : "";
+
+  const totals = fieldRows(o, TOTALS_FIELDS);
+  const advanced = fieldRows(o, ADVANCED_FIELDS);
+
+  return '<div class="card energy"><h4>' + esc(f.name) +
+    (o.tarif != null ? '<span class="chip">' + esc(TARIFF[o.tarif] || o.tarif) + "</span>" : "") +
+    "</h4>" +
+    // Kept for the live handler, which addresses the card by this id.
+    '<span class="hide" id="sv-' + esc(f.id) + '"></span>' +
+    head +
+    '<div class="note" style="margin:0 0 10px">' +
+      (exporting ? "a exportar para a rede" : imp > 0 ? "a consumir da rede" : "sem trânsito") +
+    "</div>" +
+    periodBlock +
+    (totals ? '<div class="sub">Acumulado</div>' + totals : "") +
+    (advanced ? '<div class="sub">Instantâneo</div>' + advanced : "") +
+    (o.dateTime ? '<div class="note">leitura de ' + esc(o.dateTime) + "</div>" : "") +
+    (f.driver === "PZEM_004T_V03"
+      ? '<div class="btns" style="margin-top:10px">' +
+        '<button class="btn" data-reset="' + esc(f.id) + '">Repor energia</button></div>'
+      : "") +
+    "</div>";
+}
+
+/* Sensor state arrives as JSON whose shape depends on the driver, and each
+   deserves its own words: a door is open or closed, not "active". The payload
+   values are the firmware's own (constants.h: "closed"/"open", "detected"/
+   "clear", "rain"/"clear"). */
+const BINARY_WORDS = {
+  DOOR: { closed: "fechada", open: "aberta" },
+  WINDOW: { closed: "fechada", open: "aberta" },
+};
+function sensorText(state, driver) {
+  const o = parseState(state);
+  if (o == null) {
+    // Not an object: a bare value, or nothing yet.
+    if (state == null || state === "") return "—";
+    return typeof state === "string" ? state : String(state);
+  }
+  const bits = [];
+  if (o.temperature != null) bits.push(Number(o.temperature).toFixed(1) + "°C");
+  if (o.humidity != null) bits.push(Math.round(o.humidity) + "%");
+  if (o.power != null) bits.push(Math.round(o.power) + "W");
+  if (o.distance != null) bits.push(Math.round(o.distance) + " cm");
+  if (o.illuminance != null) bits.push(Math.round(o.illuminance) + " lx");
+  if (o.liters != null) {
+    // Cubic metres are how a water bill and the meter's own dial read; litres are
+    // what the last three digits say. Show both rather than making anyone divide.
+    const m3 = Number(o.liters) / 1000;
+    bits.push(m3.toFixed(3) + " m³");
+    if (Number(o.flow) > 0) bits.push(Number(o.flow).toFixed(1) + " L/min");
+  }
+  if (o.motion != null) bits.push(o.motion === "detected" ? "movimento" : "sem movimento");
+  if (o.rain != null) bits.push(o.rain === "rain" ? "a chover" : "sem chuva");
+  if (o.state != null && !bits.length) {
+    const words = BINARY_WORDS[driver];
+    bits.push(words && words[o.state] ? words[o.state] : String(o.state));
+  }
+  if (o.error && !bits.length) bits.push("erro de leitura");
+  return bits.length ? bits.join(" · ") : "—";
+}
+
+/* Numeric readings deserve the width; binary states do not. */
+const MEASURE_DRIVERS = ["LTR303", "HCSR04", "LD2410", "LD2420", "TMF882X", "LDC1612", "TOFSENSE"];
+const CLIMATE_DRIVERS = ["DS18B20", "SHT4X", "DHT_11", "DHT_21", "DHT_22"];
+const CLIMATE_MAX_SAMPLES = 360;
+const isClimate = (f) => CLIMATE_DRIVERS.indexOf(f.driver) >= 0;
+
+function climateReading(state) {
+  const o = parseState(state);
+  if (!o || typeof o !== "object") return null;
+  const temperature = Number(o.temperature);
+  const humidity = Number(o.humidity);
+  const hasTemperature = o.temperature != null && isFinite(temperature);
+  const hasHumidity = o.humidity != null && isFinite(humidity);
+  if (!hasTemperature && !hasHumidity) return null;
+  return {
+    temperature: hasTemperature ? temperature : null,
+    humidity: hasHumidity ? humidity : null,
+  };
+}
+
+function recordClimate(f) {
+  const reading = climateReading(f.state);
+  if (!reading) return null;
+  const now = Date.now();
+  const history = climateHistory[f.id] || { samples: [], truncated: false };
+  const last = history.samples[history.samples.length - 1];
+  // renderOverview() can run again after a save; do not duplicate the reading
+  // that the live event just recorded.
+  if (!last || now - last.at > 1000) {
+    history.samples.push({ at: now, temperature: reading.temperature, humidity: reading.humidity });
+    if (history.samples.length > CLIMATE_MAX_SAMPLES) {
+      history.samples.shift();
+      history.truncated = true;
+    }
+  }
+  climateHistory[f.id] = history;
+  return history;
+}
+
+function climateSeries(samples, key, label, unit, digits, cls) {
+  const validSamples = samples.filter((sample) => sample[key] != null && isFinite(sample[key]));
+  const values = validSamples.map((sample) => sample[key]);
+  if (values.length < 2) return "";
+  const rawMin = Math.min.apply(null, values), rawMax = Math.max.apply(null, values);
+  const padding = Math.max((rawMax - rawMin) * .12, key === "temperature" ? .2 : 1);
+  const min = rawMin - padding, max = rawMax + padding, span = max - min || 1;
+  const plotted = values.map((value, i) => ({
+    x: i / (values.length - 1) * 300,
+    y: 50 - (value - min) / span * 44,
+  }));
+  const points = plotted.map((point) => point.x.toFixed(1) + "," + point.y.toFixed(1)).join(" ");
+  const area = "0,54 " + points + " 300,54";
+  const latest = plotted[plotted.length - 1];
+  const range = rawMin === rawMax
+    ? "estável · " + rawMax.toFixed(digits) + unit
+    : "mín " + rawMin.toFixed(digits) + unit + " · máx " + rawMax.toFixed(digits) + unit;
+  const clock = (sample) => new Date(sample.at).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  return '<div class="climate-series"><div class="climate-series-head"><span class="' + cls + '">' +
+    label + '</span><span>' + range +
+    '</span></div><svg class="climate-chart" viewBox="0 0 300 56" preserveAspectRatio="none" role="img" aria-label="' +
+    esc(label + " desde que a página foi aberta") + '"><line class="guide" x1="0" y1="14" x2="300" y2="14"></line>' +
+    '<line class="guide" x1="0" y1="38" x2="300" y2="38"></line>' +
+    '<polygon class="climate-area ' + cls + '" points="' + area + '"></polygon>' +
+    '<polyline class="climate-line ' + cls + '" points="' + points + '"></polyline>' +
+    '<line class="climate-latest ' + cls + '" x1="298" y1="' + (latest.y - 4).toFixed(1) +
+    '" x2="298" y2="' + (latest.y + 4).toFixed(1) + '"></line></svg>' +
+    '<div class="climate-time"><span>' + clock(validSamples[0]) + '</span><span>' +
+    clock(validSamples[validSamples.length - 1]) + '</span></div></div>';
+}
+
+function climateCard(f, shouldRecord) {
+  const reading = climateReading(f.state);
+  const history = shouldRecord ? recordClimate(f) : climateHistory[f.id];
+  const samples = history ? history.samples : [];
+  const temperature = reading && reading.temperature != null
+    ? '<span class="climate-value temperature">' + reading.temperature.toFixed(1) + '<small>°C</small></span>' : "";
+  const humidity = reading && reading.humidity != null
+    ? '<span class="climate-value humidity">' + Math.round(reading.humidity) + '<small>%</small></span>' : "";
+  const temperatureGraph = climateSeries(samples, "temperature", "temperatura", "°C", 1, "temperature");
+  const humidityGraph = climateSeries(samples, "humidity", "humidade", "%", 0, "humidity");
+  const collecting = !temperatureGraph && !humidityGraph
+    ? '<div class="climate-collecting">A recolher leituras…</div>' : "";
+  const scope = history && history.truncated ? "leituras recentes" : "desde que abriu esta página";
+  return '<div class="card climate-card" id="climate-' + esc(f.id) + '"><h4>' + esc(f.name) + '</h4>' +
+    '<div class="climate-values" id="sv-' + esc(f.id) + '">' + (temperature || humidity || "—") + '</div>' +
+    collecting + temperatureGraph + humidityGraph +
+    '<div class="climate-caption">' + scope + (samples.length ? " · " + samples.length +
+      (samples.length === 1 ? " leitura" : " leituras") : "") + "</div></div>";
+}
+
+function renderPinout() {
+  const usable = config.usablePins || [];
+  const inputOnly = config.inputOnlyPins || [];
+  const used = {};
+  for (const f of config.features || []) {
+    for (const o of f.outputs || []) used[o] = { n: f.name, k: "out" };
+    for (const i of f.inputs || []) used[i] = { n: f.name, k: "in" };
+  }
+  const all = usable.concat(inputOnly).sort((a, b) => a - b);
+  const half = Math.ceil(all.length / 2);
+  const draw = (pins, right) => pins.map((p) => {
+    const u = used[p];
+    const only = inputOnly.indexOf(p) >= 0;
+    const pinState = u ? u.k : "free";
+    const tag = pinState === "out" ? '<span class="tag t-out">SAÍDA</span>' :
+      pinState === "in" ? '<span class="tag t-in">ENTRADA</span>' : '<span class="tag t-free">LIVRE</span>';
+    const what = u ? esc(u.n) : (only ? "livre · só entrada" : "livre");
+    return '<div class="pin pin-' + pinState + (right ? " r" : "") + '"><span class="n">GPIO' + p + '</span>' +
+      '<span class="u">' + what + "</span>" + tag + "</div>";
+  }).join("");
+  $("pin-left").innerHTML = draw(all.slice(0, half), false);
+  $("pin-right").innerHTML = draw(all.slice(half), true);
+  $("pin-board").textContent = config.backupVariant || config.mcu || "—";
+  $("pin-mcu").textContent = (usable.length + inputOnly.length) + " pinos";
+  $("tpl-btns").innerHTML = TEMPLATES.map((t) =>
+    '<button class="btn" data-tpl="' + t.v + '">' + esc(t.n) + "</button>").join("");
+}
+
+/* Which feature drives a given pin, ignoring the one being edited. Every pin
+   stays on the menu — an occupied one is named, not hidden, so it is obvious
+   what has to be freed first. */
+function pinOwners(selfId) {
+  const owner = {};
+  for (const o of config.features || []) {
+    if (o.id === selfId) continue;
+    for (const p of o.outputs || []) owner[p] = o.name;
+    for (const p of o.inputs || []) owner[p] = o.name;
+  }
+  if (config.ledStrip && config.ledStrip.pin != null) owner[config.ledStrip.pin] = config.ledStrip.name;
+  return owner;
+}
+
+function pinSelect(f, fi, kind, slot, current, owner) {
+  const opts = (config.usablePins || []).map((p) =>
+    '<option value="' + p + '"' + (p === current ? " selected" : "") + ">GPIO" + p +
+    (owner[p] ? " · ocupado (" + esc(owner[p]) + ")" : "") + "</option>").join("");
+  return '<select data-pin="' + kind + '" data-i="' + fi + '" data-k="' + slot + '">' + opts + "</select>";
+}
+
+/* Editable wiring. The device refuses a pin it cannot give away, so a clash is
+   flagged here rather than letting the save look like it worked. */
+function pinEditor(f, i) {
+  const outs = f.outputs || [];
+  const ins = f.inputs || [];
+  if (!outs.length && !ins.length) return "";
+  const owner = pinOwners(f.id);
+  const block = (label, kind, pins) => !pins.length ? "" :
+    '<div class="field"><label>' + label + "</label>" +
+    '<div class="row2" style="grid-template-columns:repeat(' + Math.min(pins.length, 3) + ',1fr)">' +
+    pins.map((p, k) => pinSelect(f, i, kind, k, p, owner)).join("") + "</div></div>";
+  const clashes = outs.concat(ins).filter((p) => owner[p]);
+  const warn = clashes.length
+    ? '<div class="note err">GPIO' + clashes.join(", GPIO") + " já " +
+      (clashes.length > 1 ? "estão a ser usados" : "está a ser usado") +
+      " por <b>" + esc(owner[clashes[0]]) + "</b>. O dispositivo recusa a alteração até libertares " +
+      (clashes.length > 1 ? "esses pinos" : "esse pino") + ".</div>"
+    : "";
+  return block("SAÍDAS (relé)", "out", outs) + block("ENTRADAS (botão/sensor)", "in", ins) + warn;
+}
+
+/* How the physical input behaves. An omitted value preserves the current
+   driver; an explicit value is validated against the actuator family. Keep a
+   one-button cover on mode 2 because changing its topology also needs another
+   input pin. */
+const INPUT_MODES = [
+  { v: 0, n: "botão de pressão (momentâneo)" },
+  { v: 1, n: "interruptor (mantém posição)" },
+];
+const COVER_SINGLE_MODE = { v: 2, n: "botão único (rodar / parar)" };
+function inputModes(f) {
+  const driver = String(f.driver || "");
+  if (driver === "COVER_SINGLE_PUSH") return [COVER_SINGLE_MODE];
+  if (driver.indexOf("COVER_DUAL") === 0) return INPUT_MODES;
+  if (driver === "GARAGE_PUSH" || driver === "GARDEN_VALVE") return [];
+  return INPUT_MODES;
+}
+function inputModeField(f, i) {
+  if (!isActuator(f) || f.inputMode == null) return "";
+  const modes = inputModes(f);
+  if (!modes.length) return "";
+  const opts = modes.map((m) =>
+    '<option value="' + m.v + '"' + (m.v === f.inputMode ? " selected" : "") + ">" +
+    m.n + "</option>").join("");
+  return '<div class="field"><label>MODO DE ENTRADA</label>' +
+    '<select data-f="inputMode" data-i="' + i + '" data-num="1">' + opts + "</select></div>";
+}
+
+function featureKind(f) {
+  if (isCover(f)) return { label: "ESTORE", cls: "kind-cover" };
+  if (isActuator(f)) return { label: "ATUADOR", cls: "kind-actuator" };
+  return { label: "SENSOR", cls: "kind-sensor" };
+}
+
+function renderFeatures() {
+  const feats = config.features || [];
+  const led = config.ledStrip || null;
+  const total = feats.length + (led ? 1 : 0);
+  $("feat-count").textContent = total + (total === 1 ? " função" : " funções");
+  const ledCard = !led ? "" :
+    '<div class="card feature-card">' +
+    '<div class="feature-card-head"><span class="feature-index">FUNÇÃO ' + total + '</span>' +
+    '<div class="feature-badges"><span class="feature-badge kind-driver">Fita LED</span></div></div>' +
+    '<div class="field"><label>NOME</label><input value="' + esc(led.name) + '" disabled></div>' +
+    '<div class="row2"><div class="field"><label>PINO DE DADOS</label><input value="GPIO' + esc(led.pin) + '" disabled></div>' +
+    '<div class="field"><label>LEDS</label><input value="' + esc(led.leds) + '" disabled></div></div>' +
+    '<div class="field"><label>ENDEREÇO KNX (área / linha / membro)</label><div class="row2" style="grid-template-columns:1fr 1fr 1fr">' +
+    '<input type="number" min="0" max="31" data-led-knx="area" value="' + (led.area || 0) + '">' +
+    '<input type="number" min="0" max="7" data-led-knx="line" value="' + (led.line || 0) + '">' +
+    '<input type="number" min="0" max="255" data-led-knx="member" value="' + (led.member || 0) + '"></div>' +
+    '<p class="note" style="margin:6px 2px 0">Liga/desliga a fita e devolve o estado ao bus. 0 / 0 / 0 = sem KNX.</p></div>' +
+    '<p class="note" style="margin:0 2px 10px">Liga e desliga-se no mosaico da Visão geral; a rodinha desse mosaico abre a cor, o brilho e os efeitos. ' +
+    'Para mudar o pino, remove a função e cria-a de novo.</p>' +
+    '<div class="feature-card-actions"><button class="btn d" data-led-del="1">Remover função</button></div></div>';
+  $("feat-list").innerHTML = (feats.length || led) ? feats.map((f, i) => {
+    const cover = isCover(f);
+    const kind = featureKind(f);
+    const hasState = hasBinaryFunctionState(f);
+    const stateOn = hasState && (parseInt(f.state, 10) || 0) > 0;
+    const stateBadge = hasState ? '<span class="feature-badge feature-state ' + (stateOn ? "on" : "off") +
+      '" id="fs-' + esc(f.id) + '">' + (stateOn ? "LIGADO" : "DESLIGADO") + "</span>" : "";
+    return '<div class="card feature-card' + (stateOn ? " on" : "") + '" id="fc-' + esc(f.id) + '" data-fi="' + i + '">' +
+      '<div class="feature-card-head"><span class="feature-index">FUNÇÃO ' + (i + 1) + '</span>' +
+      '<div class="feature-badges">' + stateBadge + '<span class="feature-badge ' + kind.cls + '">' + kind.label + '</span>' +
+      '<span class="feature-badge kind-driver">' + esc(driverLabel(f.driver)) + '</span></div></div>' +
+      '<div class="field"><label>NOME</label><input data-f="name" data-i="' + i + '" maxlength="23" value="' + esc(f.name) + '"></div>' +
+      inputModeField(f, i) +
+      pinEditor(f, i) +
+      (cover ? '<div class="row2"><div class="field"><label>SUBIDA (s)</label>' +
+        '<input type="number" min="1" max="300" data-f="upCourseTime" data-i="' + i + '" value="' + (f.upCourseTime || 0) + '"></div>' +
+        '<div class="field"><label>DESCIDA (s)</label>' +
+        '<input type="number" min="1" max="300" data-f="downCourseTime" data-i="' + i + '" value="' + (f.downCourseTime || 0) + '"></div></div>' : "") +
+      (f.driver === "LDC1612" ?
+        // The coil counts turns of a target; it cannot know what ran through the
+        // meter before it was fitted. Typing the dial's own reading here is what
+        // makes the total mean something, and it is the one field that must be
+        // editable after installation.
+        // Two fields because the dial has two registers, in two colours. A single
+        // field in m3 asked people to divide the red digits by a thousand in their
+        // head, and the note telling them to copy every digit contradicted the
+        // unit on the label — so a reading of 400 m3 and 450 L was entered as
+        // 400450 m3, a thousandfold error that looks perfectly reasonable.
+        '<div class="row2"><div class="field"><label>M³ · DÍGITOS PRETOS</label>' +
+        '<input type="number" step="1" min="0" data-f="waterCubicWhole" data-i="' + i + '"' +
+        ' value="' + Math.floor((f.waterLiters || 0) / 1000) + '"></div>' +
+        '<div class="field"><label>LITROS · DÍGITOS VERMELHOS</label>' +
+        '<input type="number" step="1" min="0" max="999" data-f="waterLitresPart" data-i="' + i + '"' +
+        ' value="' + Math.round((f.waterLiters || 0) % 1000) + '"></div></div>' +
+        '<div class="field"><label>LITROS POR VOLTA</label>' +
+        '<input type="number" step="0.1" min="0.1" data-f="litersPerTurn" data-i="' + i + '"' +
+        ' value="' + (f.litersPerTurn || 1) + '"></div>' +
+        '<p class="note" style="margin:0 2px 10px">Copia os dígitos tal como estão no ' +
+        'mostrador: os <b>pretos</b> são metros cúbicos, os <b>vermelhos</b> são litros. ' +
+        'Os litros por volta estão marcados na face do contador — no Itron Aquadis+ é ' +
+        '<b>HF 1L</b>.</p>' : "") +
+      (isActuator(f) ? '<div class="field"><label>DESLIGAR SOZINHO (segundos, 0 = nunca)</label>' +
+        '<input type="number" min="0" data-f="autoOff" data-i="' + i + '" value="' + (f.autoOff || 0) + '"></div>' +
+        '<div class="field"><label>ENDEREÇO KNX (área / linha / membro)</label><div class="row2" style="grid-template-columns:1fr 1fr 1fr">' +
+        '<input type="number" min="0" max="31" data-f="area" data-i="' + i + '" value="' + (f.area || 0) + '">' +
+        '<input type="number" min="0" max="7" data-f="line" data-i="' + i + '" value="' + (f.line || 0) + '">' +
+        '<input type="number" min="0" max="255" data-f="member" data-i="' + i + '" value="' + (f.member || 0) + '">' +
+        "</div></div>" : "") +
+      '<div class="feature-card-actions"><button class="btn d" data-del="' + esc(f.id) + '">Remover função</button></div></div>';
+  }).join("") + ledCard : '<div class="note">Ainda não há funções configuradas.</div>';
+}
+
+function renderDiag() {
+  const heap = config.freeHeap;
+  if (heap != null) {
+    heapHistory.push(heap);
+    if (heapHistory.length > 40) heapHistory.shift();
+    $("d-heap").innerHTML = (heap / 1024).toFixed(1) + "<small>KB</small>";
+    drawSpark("d-heap-spark", heapHistory, accent());
+    const frag = config.heapFrag;
+    $("d-heap-note").textContent = frag != null
+      ? "fragmentação " + frag + "% · maior bloco livre " + Math.round((config.maxFreeBlock || 0) / 1024) + " KB"
+      : "";
+  }
+  $("d-reset").textContent = config.resetReason || "—";
+  $("d-uptime").textContent = duration(config.uptime);
+  $("d-fw").textContent = (config.firmware || "—") + (config.buildDate ? " · " + config.buildDate : "");
+  $("d-sketch").textContent = config.sketchSize
+    ? Math.round(config.sketchSize / 1024) + " KB · livre " + Math.round((config.freeSketchSpace || 0) / 1024) + " KB" : "—";
+  $("d-ssid").textContent = config.wifiSSID || "—";
+  $("d-rssi").textContent = rssiText(config.signal);
+  const netState = config.signal == null ? "off" : rssiClass(config.signal);
+  const netLabel = netState === "ok" ? "bom" : netState === "warn" ?
+    (config.signal < -80 ? "muito fraco" : "fraco") : "desconhecido";
+  $("d-net-card").className = "card status-card " + netState;
+  setStatusBadge($("d-net-status"), netState, netLabel);
+  $("d-ip").textContent = config.wifiIp || "—";
+  $("d-net").textContent = (config.wifiMask || "—") + " / " + (config.wifiGw || "—");
+  setMqttPill(config.mqttConnected);
+  $("d-broker").textContent = (config.mqttIpDns || "—") + ":" + (config.mqttPort || "");
+  const cloud = config.cloudConfigured;
+  // Three distinct states, because "não configurada" on a working device sent
+  // people looking for a problem that was not there.
+  const cloudState = !cloud ? "off" : config.cloudConnected ? "ok" : "bad";
+  const cloudText = !cloud ? "sem credenciais (não adotado)" :
+    config.cloudConnected ? "ligada" : "adotado, sem ligação";
+  setStatusBadge($("d-cloud"), cloudState, cloudText);
+  // Without a synced clock the device refuses to run a schedule rather than
+  // guess the hour, so the panel has to be able to say that out loud.
+  const clockState = config.clockSynced ? "ok" : "warn";
+  setStatusBadge($("d-clock"),
+    clockState,
+    config.clockSynced ? (config.clockNow || "certo").replace("T", " ") : "sem hora (NTP)");
+  // The card edge summarizes the worst active condition while the badges keep
+  // the cause visible. Intentionally disabled services are excluded so an
+  // unused local MQTT broker cannot turn an otherwise healthy card red.
+  const linkStates = [clockState, cloudState];
+  if ((config.mqttIpDns || "").trim()) linkStates.push(config.mqttConnected ? "ok" : "bad");
+  const linksState = linkStates.includes("bad") ? "bad" :
+    linkStates.includes("warn") ? "warn" : linkStates.includes("ok") ? "ok" : "off";
+  $("d-links-card").className = "card status-card " + linksState;
+}
+
+function drawSpark(id, values, colour) {
+  const el = $(id);
+  if (!el || values.length < 2) return;
+  const min = Math.min.apply(null, values), max = Math.max.apply(null, values);
+  const span = (max - min) || 1;
+  const pts = values.map((v, i) =>
+    (i / (values.length - 1) * 200).toFixed(1) + "," + (34 - (v - min) / span * 30).toFixed(1)).join(" ");
+  el.innerHTML = '<polyline fill="none" stroke="' + colour + '" stroke-width="1.5" points="' + pts + '"/>';
+}
+
+function fillSystem() {
+  $("s-nodeId").value = config.nodeId || "";
+  $("s-ssid").value = config.wifiSSID || "";
+  $("s-wpw").value = "";
+  $("s-dhcp").checked = config.dhcp !== false;
+  $("s-static").classList.toggle("hide", $("s-dhcp").checked);
+  $("s-ip").value = config.wifiIp || "";
+  $("s-mask").value = config.wifiMask || "";
+  $("s-gw").value = config.wifiGw || "";
+  // Only C6 builds can drive the XIAO's RF switch.
+  $("s-antenna-box").classList.toggle("hide", !config.antennaSwitch);
+  $("s-antenna").value = String(config.wifiAntenna || 0);
+  $("s-mqttHost").value = config.mqttIpDns || "";
+  $("s-mqttPort").value = config.mqttPort || 1883;
+  $("s-mqttUser").value = config.mqttUsername || "";
+  $("s-mqttPw").value = "";
+  $("s-apiUser").value = config.apiUser || "";
+  $("s-apiPw").value = "";
+  // Name the variant on the upload warning so the right .bin is picked.
+  $("u-mcu").textContent = config.mcu || "desconhecida";
+  updateNameDirty();
+}
+
+function updateNameDirty() {
+  const changed = $("s-nodeId").value.trim() !== (config.nodeId || "");
+  $("s-name-dirty").classList.toggle("hide", !changed);
+}
+
+function showSystemPane(name) {
+  document.querySelectorAll(".system-tab").forEach((tab) => {
+    const on = tab.dataset.systemView === name;
+    tab.classList.toggle("on", on);
+    tab.setAttribute("aria-selected", String(on));
+  });
+  document.querySelectorAll(".system-pane").forEach((pane) =>
+    pane.classList.toggle("on", pane.id === "system-" + name));
+}
+
+function openFirmwareSettings() {
+  const systemTab = document.querySelector('[data-view="system"]');
+  const firmwareTab = document.querySelector('[data-system-view="firmware"]');
+  if (systemTab) systemTab.click();
+  if (firmwareTab) firmwareTab.click();
+  window.scrollTo({ top: 0, behavior: "auto" });
+}
+
+function fillNewFeatureForm() {
+  const sel = $("nf-driver");
+  // The strip is offered only by firmwares that carry it; the ESP8266 has no memory for it.
+  const drivers = DRIVERS.filter((g) => config.ledSupport === true || !g.items.some((d) => d.v === 200));
+  sel.innerHTML = drivers.map((g) => '<optgroup label="' + esc(g.g) + '">' +
+    g.items.map((d) => '<option value="' + d.v + '">' + esc(d.n) + "</option>").join("") + "</optgroup>").join("");
+  // Every usable pin is listed; an occupied one names its owner instead of
+  // disappearing, so it is clear what is in the way.
+  const owner = pinOwners(null);
+  const pins = config.usablePins || [];
+  const opts = pins.map((p) =>
+    '<option value="' + p + '">GPIO' + p +
+    (owner[p] ? " · ocupado (" + esc(owner[p]) + ")" : "") + "</option>").join("");
+  const first = pins.find((p) => !owner[p]);
+  $("nf-p1").innerHTML = opts;
+  $("nf-p2").innerHTML = opts;
+  if (first != null) $("nf-p1").value = String(first);
+  onDriverChange();
+  onNewPinChange();
+}
+function onDriverChange() {
+  const d = driverInfo(parseInt($("nf-driver").value, 10));
+  const singlePin = !d || d.pins < 2;
+  $("nf-p2-box").classList.toggle("hide", singlePin);
+  $("nf-leds-box").classList.toggle("hide", !d || d.v !== 200);
+  $("nf-fields").classList.toggle("two-pins", !singlePin);
+  // UART drivers name the pins by their role; the rest keep the generic labels.
+  $("nf-p1-lbl").textContent = d && d.l ? d.l[0] : "PINO";
+  $("nf-p2-lbl").textContent = d && d.l ? d.l[1] : "SEGUNDO PINO";
+  onNewPinChange();
+}
+
+/* Warn before the device refuses the pin, rather than after. */
+function onNewPinChange() {
+  const d = driverInfo(parseInt($("nf-driver").value, 10));
+  const owner = pinOwners(null);
+  const chosen = [parseInt($("nf-p1").value, 10)];
+  if (d && d.pins > 1) chosen.push(parseInt($("nf-p2").value, 10));
+  const busy = chosen.filter((p) => !isNaN(p) && owner[p]);
+  const msg = $("nf-msg");
+  if (busy.length) {
+    msg.className = "note err";
+    msg.innerHTML = "GPIO" + busy.join(", GPIO") + " já " +
+      (busy.length > 1 ? "estão ocupados" : "está ocupado") +
+      " por <b>" + esc(owner[busy[0]]) + "</b>. Escolhe outro ou liberta-o primeiro.";
+  } else if (msg.className.indexOf("err") >= 0) {
+    msg.className = "note";
+    msg.textContent = "";
+  }
+}
+
+/* ---------------- actions ---------------- */
+async function control(id, state, confirmedState) {
+  try {
+    await api("/actuators/control", { method: "POST", body: JSON.stringify({ id: id, state: state }) });
+    // The Overview tile moves optimistically. Persist the state in the shared
+    // model after the device accepts the command as well, so a delayed/missed
+    // Safari EventSource message cannot leave Functions stale until reload.
+    if (confirmedState != null) applyFeatureState(id, confirmedState);
+  }
+  catch (e) {
+    // "Applied but not saved" is a different answer from "did not happen": the
+    // output moved, the state did not reach flash.
+    if (e && e.body && e.body.result === 6 && e.body.applied === true) {
+      toast("Comando executado, mas o estado não ficou guardado", "err");
+    } else {
+      toast("Não foi possível comandar", "err");
+    }
+  }
+}
+
+async function addFeature() {
+  const name = $("nf-name").value.trim();
+  const driver = parseInt($("nf-driver").value, 10);
+  const d = driverInfo(driver);
+  const msg = $("nf-msg");
+  if (!name) { msg.className = "note err"; msg.textContent = "Dá um nome à função."; return; }
+  const p1 = parseInt($("nf-p1").value, 10);
+  const p2 = d && d.pins > 1 ? parseInt($("nf-p2").value, 10) : undefined;
+  if (d && d.pins > 1 && p1 === p2) {
+    msg.className = "note err"; msg.textContent = "Os dois pinos têm de ser diferentes."; return;
+  }
+  msg.className = "note"; msg.textContent = "A criar…";
+  const body = { name: name, driver: driver, input1: p1 };
+  if (p2 !== undefined) body.input2 = p2;
+  if (driver === 200) {
+    const n = parseInt($("nf-leds").value, 10);
+    if (!(n >= 1 && n <= 600)) { msg.className = "note err"; msg.textContent = "O número de LEDs tem de ser entre 1 e 600."; return; }
+    body.leds = n;
+  }
+  try {
+    config = await api("/features", { method: "POST", body: JSON.stringify(body) });
+    $("nf-name").value = "";
+    msg.className = "note ok"; msg.textContent = "Criada.";
+    renderOverview(); renderPinout(); renderFeatures(); fillNewFeatureForm();
+    wireFeatureEvents();
+    toast("Função criada", "ok");
+  } catch (e) {
+    msg.className = "note err";
+    msg.textContent = featureError(e);
+  }
+}
+
+/* prepareNewFeature() refuses with a numeric code; say which one it was. */
+function featureError(e) {
+  const code = e && e.body && e.body.result;
+  if (code === 1) return "Dá um nome à função.";
+  if (code === 2) return "Esse pino não serve nesta placa — escolhe outro.";
+  if (code === 3) return "Tipo de função inválido para este firmware.";
+  if (code === 4) return "Este tipo precisa de dois pinos válidos.";
+  if (code === 5) return "Esse pino já está a ser usado por outra função.";
+  if (code === 6) return "Não foi possível guardar na memória do dispositivo; a função não será mantida.";
+  if (code === 7) return "Já existe uma fita LED. Remove-a primeiro para criar outra.";
+  return "O dispositivo recusou a função.";
+}
+
+/* ConfigOnofre::update() returns stable result codes for rejected saves. */
+function configError(e) {
+  const code = e && e.body && e.body.result;
+  if (code === 1) return "A configuração enviada é inválida.";
+  if (code === 2) return "Um dos pinos não é válido nesta placa.";
+  if (code === 3) return "A quantidade de pinos não corresponde ao tipo de função.";
+  if (code === 4) return "Um dos pinos já está a ser usado por outra função.";
+  if (code === 5) return "O dispositivo está ocupado — tenta guardar novamente.";
+  if (code === 6) return "Não foi possível guardar na memória do dispositivo; a configuração anterior será reposta.";
+  return "Não foi possível guardar.";
+}
+
+async function save() {
+  const body = JSON.parse(JSON.stringify(config));
+  body.nodeId = $("s-nodeId").value.trim();
+  body.wifiSSID = $("s-ssid").value.trim();
+  if ($("s-wpw").value) body.wifiSecret = $("s-wpw").value;
+  body.dhcp = $("s-dhcp").checked;
+  if (body.dhcp) {
+    // GET /config reports the live DHCP lease for diagnostics. It is not a
+    // static-address edit and must not make an unrelated save restart Wi-Fi.
+    delete body.wifiIp;
+    delete body.wifiMask;
+    delete body.wifiGw;
+  } else {
+    body.wifiIp = $("s-ip").value.trim();
+    body.wifiMask = $("s-mask").value.trim();
+    body.wifiGw = $("s-gw").value.trim();
+  }
+  if (config.antennaSwitch) body.wifiAntenna = parseInt($("s-antenna").value, 10) || 0;
+  body.mqttIpDns = $("s-mqttHost").value.trim();
+  body.mqttPort = parseInt($("s-mqttPort").value, 10) || 1883;
+  body.mqttUsername = $("s-mqttUser").value.trim();
+  if ($("s-mqttPw").value) body.mqttPassword = $("s-mqttPw").value;
+  body.apiUser = $("s-apiUser").value.trim();
+  if ($("s-apiPw").value) body.apiPassword = $("s-apiPw").value;
+  if (removed.length) body.featuresToRemove = removed;
+
+  const btn = $("save-btn");
+  btn.disabled = true;
+  btn.textContent = "A guardar…";
+  try {
+    const saved = await api("/config", { method: "POST", body: JSON.stringify(body) });
+    const restartRequired = saved.restartRequired === true;
+    config = saved;
+    removed = [];
+    clearDirty();
+    toast(restartRequired ? "Guardado — o dispositivo vai reiniciar." : "Guardado", "ok");
+    renderHeader(); renderOverview(); renderPinout(); renderFeatures(); renderDiag(); fillSystem(); fillNewFeatureForm();
+    wireFeatureEvents();
+  } catch (e) {
+    toast(configError(e), "err");
+  } finally {
+    // Always restore the button: leaving it disabled strands the page with no
+    // way to retry, which is how a failed save looked like a silent one.
+    btn.textContent = "Guardar";
+    btn.disabled = !dirty;
+  }
+}
+
+/* confirm() is silently blocked inside sandboxed frames and is easy to misfire
+   on a phone, so destructive buttons ask for a second click on themselves. */
+function armed(btn, label) {
+  if (btn.dataset.armed === "1") {
+    clearTimeout(btn._disarm);
+    btn.dataset.armed = "";
+    btn.textContent = btn.dataset.label;
+    btn.classList.remove("d");
+    return true;
+  }
+  btn.dataset.label = btn.textContent;
+  btn.dataset.armed = "1";
+  btn.textContent = label;
+  btn.classList.add("d");
+  clearTimeout(btn._disarm);
+  btn._disarm = setTimeout(() => {
+    btn.dataset.armed = "";
+    btn.textContent = btn.dataset.label;
+    btn.classList.remove("d");
+  }, 4000);
+  return false;
+}
+
+async function applyTemplate(v) {
+  try {
+    await api("/templates/change?t=" + v, { method: "POST" });
+    toast("Predefinição aceite · a reiniciar", "ok");
+  } catch (e) { toast("Não foi possível aplicar", "err"); }
+}
+
+/* Update availability. The device only knows its own version, so the panel asks
+   the release server and offers the update when there is one — otherwise nobody
+   discovers a fix exists. Compared component by component as numbers: string
+   comparison would rank 9.99 above 9.100. */
+const UPDATE_HOST = "https://update.bhonofre.pt";
+
+function versionParts(v) {
+  return String(v == null ? "" : v).trim().split("-")[0].split(".")
+    .map((p) => parseInt(p.replace(/[^0-9]/g, ""), 10) || 0);
+}
+function isNewer(candidate, current) {
+  const a = versionParts(candidate), b = versionParts(current);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+async function checkForUpdate() {
+  const btn = $("a-update");
+  const note = $("u-avail");
+  if (!config.mcu) return;
+  let latest = "";
+  try {
+    // Cross-origin by design; an https fetch from this http page is allowed.
+    const res = await fetch(UPDATE_HOST + "/firmware/latest-version/" + encodeURIComponent(config.mcu),
+      { mode: "cors" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    latest = (await res.text()).trim();
+  } catch (e) {
+    // Offline, or no route to the release server — say so instead of implying
+    // the firmware is current.
+    note.className = "note";
+    note.textContent = "Não foi possível verificar se há atualização.";
+    setFirmwareHeaderState("error");
+    return;
+  }
+  if (isNewer(latest, config.firmware)) {
+    note.className = "note ok";
+    note.textContent = "Está disponível a versão " + latest + ".";
+    btn.textContent = "Atualizar para a " + latest;
+    btn.classList.add("p");
+    setFirmwareHeaderState("available", latest);
+  } else {
+    note.className = "note";
+    note.textContent = latest
+      ? "Já tens a versão mais recente (" + latest + ")."
+      : "";
+    btn.textContent = "Procurar atualização";
+    btn.classList.remove("p");
+    setFirmwareHeaderState("current");
+  }
+}
+
+/* Every published build for THIS board, newest first, each a direct download.
+   Filtering by the device's own MCU is the point: handing someone the wrong
+   variant's image is the one mistake here that costs a USB recovery. */
+async function listFirmwareVersions(btn) {
+  const box = $("u-versions");
+  if (!config.mcu) return;
+  if (box.dataset.open === "1") {          // second press closes it again
+    box.dataset.open = "";
+    box.innerHTML = "";
+    btn.textContent = "Ver versões disponíveis";
+    return;
+  }
+  btn.disabled = true;
+  box.innerHTML = '<div class="note">A consultar…</div>';
+  let list;
+  try {
+    const res = await fetch(UPDATE_HOST + "/firmware/all-versions/" + encodeURIComponent(config.mcu),
+      { mode: "cors" });
+    list = await res.json();
+  } catch (e) {
+    box.innerHTML = '<div class="note err">Não foi possível obter a lista. ' +
+      "Verifica se o dispositivo tem acesso à internet.</div>";
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  if (!Array.isArray(list) || !list.length) {
+    box.innerHTML = '<div class="note">Não há binários publicados para ' + esc(config.mcu) + ".</div>";
+    return;
+  }
+  box.dataset.open = "1";
+  btn.textContent = "Esconder versões";
+  box.innerHTML = '<div class="sub">' + esc(config.mcu) + " · " + list.length +
+    " versões, mais recente primeiro</div>" +
+    list.map((v) => {
+      const installed = v.version === config.firmware;
+      return '<div class="fwrow' + (installed ? " now" : "") + '">' +
+        "<b>" + esc(v.version) + "</b>" +
+        '<span>' + (installed ? "instalada" : "") + "</span>" +
+        // A plain link: the server answers application/octet-stream, so the
+        // browser saves it instead of trying to render it.
+        '<a class="btn" href="' + esc(v.url) + '" download>Descarregar</a></div>';
+    }).join("") +
+    '<div class="note">Descarrega o ficheiro e escolhe-o abaixo em "Escolher ficheiro".</div>';
+}
+
+/* Manual firmware upload — the recovery path when the cloud is unreachable.
+   POST /update takes a multipart body and reboots the device when it ends. */
+function uploadFirmware(btn) {
+  const file = ($("u-file").files || [])[0];
+  const msg = $("u-msg");
+  if (!file) {
+    msg.className = "note err";
+    msg.textContent = "Escolhe primeiro o ficheiro .bin.";
+    return;
+  }
+  // Both ESP8266 and ESP32 application images start with 0xE9. Refusing anything
+  // else here costs nothing and saves a USB recovery after an accidental pick.
+  const head = new FileReader();
+  head.onload = () => {
+    if (new Uint8Array(head.result)[0] !== 0xe9) {
+      msg.className = "note err";
+      msg.textContent = "Isto não parece uma imagem de firmware. Envio cancelado.";
+      return;
+    }
+    if (!armed(btn, "Confirmar envio?")) return;
+    send();
+  };
+  head.readAsArrayBuffer(file.slice(0, 1));
+
+  function send() {
+    const bar = $("u-bar");
+    const fill = bar.querySelector("i");
+    bar.classList.remove("hide");
+    $("u-send").disabled = true;
+    msg.className = "note";
+    msg.textContent = "A enviar… não desligues o dispositivo.";
+
+    const form = new FormData();
+    form.append("update", file, file.name);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", baseUrl + "/update");
+    // fetch() reports no upload progress, and this can be a slow minute on WiFi.
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) fill.style.width = Math.round(e.loaded / e.total * 100) + "%";
+    };
+    const done = (ok) => {
+      $("u-send").disabled = false;
+      msg.className = ok ? "note ok" : "note err";
+      msg.textContent = ok
+        ? "Enviado. O dispositivo está a reiniciar — volta a abrir esta página daqui a pouco."
+        : "O envio falhou. O firmware anterior continua ativo; tente novamente.";
+    };
+    // The backend now returns a truthful status before scheduling a restart.
+    // Sending every byte is not proof that flash finalization succeeded.
+    xhr.onload = () => done(xhr.status === 200);
+    xhr.onerror = () => done(false);
+    xhr.send(form);
+  }
+}
+
+/* The firmware constructs the backup from persisted fields, not from the
+   diagnostic /config response. Credentials never enter the browser payload. */
+async function exportConfig() {
+  const msg = $("r-msg");
+  let snapshot;
+  try {
+    snapshot = await api("/backup", { cache: "no-store" });
+  } catch (e) {
+    msg.className = "note err";
+    msg.textContent = "Não foi possível criar a cópia de configuração.";
+    return;
+  }
+  const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "BACKUP_" + (config.nodeId || "onofre") + "_ONOFRE_" + (config.firmware || "") + ".json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  msg.className = "note ok";
+  msg.textContent = "Cópia criada sem palavras-passe.";
+}
+
+async function restoreConfig(file, btn) {
+  const msg = $("r-msg");
+  if (!armed(btn, "Confirmar recuperação?")) {
+    msg.className = "note err";
+    msg.textContent = "A recuperação substitui todas as funções e programas. Carrega novamente para confirmar.";
+    return;
+  }
+  btn.disabled = true;
+  msg.className = "note";
+  msg.textContent = "A validar a cópia…";
+  try {
+    if (!file || file.size >= 16 * 1024)
+      throw new Error("O ficheiro não é uma cópia JSON válida ou é demasiado grande.");
+    let snapshot;
+    try { snapshot = JSON.parse(await file.text()); }
+    catch (e) { throw new Error("Não foi possível ler este ficheiro JSON."); }
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot))
+      throw new Error("O ficheiro não contém uma configuração válida.");
+    if (snapshot.format !== "easyiot-backup" || snapshot.version !== 1 ||
+        !snapshot.target || !snapshot.configuration || !snapshot.irrigation)
+      throw new Error("Este ficheiro não é uma cópia de configuração EasyIot.");
+    if (String(snapshot.target.mcu || "") !== String(config.backupVariant || config.mcu || ""))
+      throw new Error("Esta cópia foi criada para outra variante de hardware.");
+    const forbidden = ["mqttPassword", "wifiSecret", "accessPointPassword",
+      "apiPassword", "cloudIOPassword"];
+    if (forbidden.some((field) => Object.prototype.hasOwnProperty.call(snapshot.configuration, field)))
+      throw new Error("A cópia contém credenciais e foi recusada por segurança.");
+
+    await api("/restore", { method: "POST", body: JSON.stringify(snapshot) });
+    msg.className = "note ok";
+    msg.textContent = "Recuperação validada. O equipamento vai reiniciar e aplicar a cópia completa.";
+    toast("Recuperação aceite · a reiniciar", "ok");
+  } catch (e) {
+    msg.className = "note err";
+    msg.textContent = e && e.body ? configError(e) : (e.message || "Não foi possível restaurar a configuração.");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------------- live updates ---------------- */
+function addLog(kind, text) {
+  if (logPaused) return;
+  const now = new Date().toTimeString().slice(0, 8);
+  logLines.push(now + "  " + text);
+  if (logLines.length > 200) logLines.shift();
+  const el = $("d-log");
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.innerHTML = logLines.map((l) => {
+    const k = l.indexOf("[erro]") >= 0 ? "e" : l.indexOf("[aviso]") >= 0 ? "w" : "i";
+    return '<div><span class="t">' + esc(l.slice(0, 8)) + '</span> <span class="' + k + '">' +
+      esc(l.slice(10)) + "</span></div>";
+  }).join("");
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+function connectEvents() {
+  if (!window.EventSource) return;
+  source = new EventSource(baseUrl + "/events");
+  source.addEventListener("mqtt_health", (e) => {
+    const on = e.data === "online";
+    config.mqttConnected = on;
+    setMqttPill(on);
+    addLog("i", "[mqtt] " + (on ? "ligado" : "desligado"));
+  });
+  // Every feature publishes its state under its own id.
+  source.onmessage = () => {};
+  source.addEventListener("error", () => addLog("i", "[aviso] ligação de eventos interrompida"));
+  // Feature events are named after the uniqueId, so they are wired per feature.
+  wireFeatureEvents();
+}
+function wireFeatureEvents() {
+  if (!source) return;
+  // Config responses replace the feature objects. Remove the old closures so
+  // events update the current objects and newly added/restored ids are wired.
+  for (const entry of featureEventHandlers) {
+    source.removeEventListener(entry.id, entry.handler);
+  }
+  featureEventHandlers = [];
+  for (const f of config.features || []) {
+    (function (feat) {
+      const handler = (e) => {
+        // Always resolve the current object. Saving or restoring configuration
+        // replaces config.features, and an older closure must not update a
+        // detached object that only becomes visible after a full page reload.
+        const current = applyFeatureState(feat.id, e.data) || feat;
+        if (isActuator(current)) {
+          const sw = document.querySelector('[data-toggle="' + current.id + '"]');
+          if (sw) {
+            const on = (parseInt(e.data, 10) || 0) > 0;
+            setToggleTileState(sw, on);
+          }
+          const rng = document.querySelector('[data-cover="' + current.id + '"]');
+          if (rng) rng.value = 100 - (parseInt(e.data, 10) || 0);
+          // A valve tile carries more than a switch position (open/closed plus
+          // the countdown), so redraw the strip instead of poking one node.
+          if (isZone(current) && irrigation) {
+            // The device cancels the cycle when a valve is taken over by hand,
+            // so the state card must not keep counting down a dead program.
+            const run = irrigation.running;
+            const open = (parseInt(e.data, 10) || 0) > 0;
+            seedZoneClock(current, open, run);
+            // Any valve of the cycle closing, or a valve outside it opening, means
+            // the device cancelled the cycle: it must not keep counting down.
+            if (run && (open ? !isRunningZone(run, current.id) : isRunningZone(run, current.id))) {
+              irrigation.running = null;
+              renderIrrStatus();
+            }
+            renderIrrZones();
+          }
+        } else if (isEnergy(current)) {
+          // The whole card is derived from the payload, so redraw it in place.
+          const el = $("sv-" + current.id);
+          const card = el && el.closest(".card");
+          if (card) card.outerHTML = energyCard(current);
+        } else if (isClimate(current)) {
+          recordClimate(current);
+          const card = $("climate-" + current.id);
+          if (card) card.outerHTML = climateCard(current, false);
+        } else {
+          const el = $("sv-" + current.id);
+          if (el) el.textContent = sensorText(e.data, current.driver);
+        }
+        addLog("i", "[" + current.name + "] " + String(e.data).slice(0, 90));
+      };
+      source.addEventListener(feat.id, handler);
+      featureEventHandlers.push({ id: feat.id, handler: handler });
+    })(f);
+  }
+}
+
+/* ---------------- wiring ---------------- */
+document.addEventListener("click", (ev) => {
+  const systemTab = ev.target.closest("[data-system-view]");
+  if (systemTab) {
+    showSystemPane(systemTab.dataset.systemView);
+    return;
+  }
+  const tab = ev.target.closest("[data-view]");
+  if (tab) {
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t === tab));
+    document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === "v-" + tab.dataset.view));
+    // Do not rebuild the form: that would destroy unsaved edits. Reconcile only
+    // runtime state when Functions opens, covering events missed while Safari
+    // throttled the background EventSource connection.
+    if (tab.dataset.view === "features") refreshFeatureStates();
+    // Read once on arrival, so nobody has to know there is a button for it.
+    if (tab.dataset.view === "diag") loadDeviceLog();
+    return;
+  }
+  // The cog is inside the tile, so it must claim the click before the toggle.
+  const cfg = ev.target.closest("[data-config]");
+  if (cfg) {
+    openFeatureConfig(cfg.dataset.config);
+    return;
+  }
+  const sw = ev.target.closest("[data-toggle]");
+  if (sw) {
+    const on = sw.classList.toggle("on");
+    setToggleTileState(sw, on);
+    control(sw.dataset.toggle, 102, on ? 100 : 0);
+    return;
+  }
+  const tpl = ev.target.closest("[data-tpl]");
+  if (tpl) {
+    if (armed(tpl, "Substituir tudo?")) applyTemplate(parseInt(tpl.dataset.tpl, 10));
+    return;
+  }
+  // Irrigation: zone command, day toggle, add/remove program, stop, save.
+  const zbtn = ev.target.closest("[data-zone]");
+  if (zbtn) {
+    const z = zones().find((x) => x.id === zbtn.dataset.zone);
+    if (z) control(z.id, String(z.state) === "100" ? 0 : 100);
+    return;
+  }
+  if (ev.target.closest("#irr-stop")) { stopIrrigation(); return; }
+  if (ev.target.closest("#irr-save")) { saveIrrigation(); return; }
+  const day = ev.target.closest("[data-ipday]");
+  if (day) {
+    const parts = day.dataset.ipday.split(":");
+    const prog = irrigation.programs[Number(parts[0])];
+    prog.weekdays ^= (1 << Number(parts[1]));
+    day.classList.toggle("on", ((prog.weekdays >> Number(parts[1])) & 1) === 1);
+    markIrrDirty();
+    refreshProgramNote(Number(parts[0]));
+    return;
+  }
+  const prun = ev.target.closest("[data-iprun]");
+  if (prun) {
+    // Forcing a cycle waters the whole garden, so it asks first.
+    if (armed(prun, "Regar tudo?")) runProgramNow(parseInt(prun.dataset.iprun, 10));
+    return;
+  }
+  const pdel = ev.target.closest("[data-ipdel]");
+  if (pdel) {
+    irrigation.programs.splice(Number(pdel.dataset.ipdel), 1);
+    markIrrDirty();
+    renderIrrPrograms();
+    return;
+  }
+  if (ev.target.closest("#irr-add")) {
+    irrigation.programs = irrigation.programs || [];
+    irrigation.programs.push({
+      id: Math.max(0, ...irrigation.programs.map((x) => x.id || 0)) + 1,
+      enabled: true, startMinute: 420, weekdays: 0b0111110, zones: [],
+    });
+    markIrrDirty();
+    renderIrrPrograms();
+    return;
+  }
+  const rst = ev.target.closest("[data-reset]");
+  if (rst) {
+    if (!armed(rst, "Repor a zero?")) return;
+    api("/sensors/reset-energy", { method: "POST", body: JSON.stringify({ id: rst.dataset.reset }) })
+      .then(() => toast("Pedido de reposição em fila — confirme o valor na próxima leitura", "ok"))
+      .catch(() => toast("Não foi possível repor o contador", "err"));
+    return;
+  }
+  const ledDel = ev.target.closest("[data-led-del]");
+  if (ledDel) {
+    if (!armed(ledDel, "Confirmar?")) return;
+    api("/led/remove", { method: "POST" })
+      .then(() => api("/config"))
+      .then((c) => {
+        config = c;
+        renderOverview(); renderPinout(); renderFeatures(); fillNewFeatureForm(); wireFeatureEvents();
+        toast("Fita LED removida", "ok");
+      })
+      .catch(() => toast("Não foi possível remover a fita", "err"));
+    return;
+  }
+  const del = ev.target.closest("[data-del]");
+  if (del) {
+    if (!armed(del, "Confirmar?")) return;
+    removed.push(del.dataset.del);
+    config.features = (config.features || []).filter((f) => f.id !== del.dataset.del);
+    renderFeatures(); renderOverview(); renderPinout(); markDirty();
+    return;
+  }
+});
+
+document.addEventListener("change", (ev) => {
+  const cover = ev.target.closest("[data-cover]");
+  if (cover) {
+    // Slider is % open; the device wants % closed.
+    control(cover.dataset.cover, 100 - (parseInt(cover.value, 10) || 0));
+    return;
+  }
+  const pin = ev.target.closest("[data-pin]");
+  if (pin) {
+    const feat = config.features[parseInt(pin.dataset.i, 10)];
+    if (feat) {
+      const list = pin.dataset.pin === "out" ? feat.outputs : feat.inputs;
+      list[parseInt(pin.dataset.k, 10)] = parseInt(pin.value, 10);
+      renderFeatures();   // other selects must drop the pin just claimed
+      markDirty();
+    }
+    return;
+  }
+  const f = ev.target.closest("[data-f]");
+  if (f) {
+    const i = parseInt(f.dataset.i, 10);
+    const key = f.dataset.f;
+    // A <select> reports type "select-one", so numeric ones say so explicitly;
+    // the firmware validates inputMode as an unsigned integer when it is sent.
+    const numeric = f.type === "number" || f.dataset.num === "1";
+    // The dial reads in two registers and the firmware counts one total, so the
+    // two inputs are combined here. Both are read from the DOM rather than from
+    // the model: whichever one was just typed is not in the model yet.
+    if (key === "waterCubicWhole" || key === "waterLitresPart") {
+      if (config.features[i]) {
+        const readField = function (name) {
+          const el = document.querySelector(
+            '[data-f="' + name + '"][data-i="' + i + '"]');
+          return el ? Math.max(0, Math.floor(parseFloat(el.value) || 0)) : 0;
+        };
+        const litres = Math.min(999, readField("waterLitresPart"));
+        config.features[i].waterLiters = readField("waterCubicWhole") * 1000 + litres;
+        markDirty();
+      }
+      return;
+    }
+    if (key === "litersPerTurn") {
+      if (config.features[i]) {
+        config.features[i].litersPerTurn = Math.max(0.1, parseFloat(f.value) || 1);
+        markDirty();
+      }
+      return;
+    }
+    const val = numeric ? (parseInt(f.value, 10) || 0) : f.value;
+    if (config.features[i]) { config.features[i][key] = val; markDirty(); }
+    return;
+  }
+  // Irrigation edits: start time, zone selection, per-zone duration.
+  const ip = ev.target.closest("[data-ip]");
+  if (ip) {
+    const prog = irrigation.programs[Number(ip.dataset.pi)];
+    if (ip.dataset.ip === "enabled") prog.enabled = ip.checked;
+    if (ip.dataset.ip === "start") {
+      const m = minutesFromHhmm(ip.value);
+      if (m == null) { toast("Hora inválida", "err"); return; }
+      prog.startMinute = m;
+    }
+    markIrrDirty();
+    refreshProgramNote(Number(ip.dataset.pi));
+    return;
+  }
+  const ipz = ev.target.closest("[data-ipz]");
+  if (ipz) {
+    const parts = ipz.dataset.ipz.split(":");
+    const prog = irrigation.programs[Number(parts[0])], zid = parts[1];
+    prog.zones = prog.zones || [];
+    if (ipz.checked) {
+      if (!prog.zones.some((z) => z.uniqueId === zid)) prog.zones.push({ uniqueId: zid, minutes: 10 });
+      // The zones run in the order they are stored, so keep that equal to the
+      // order they are listed in: the screen says "por esta ordem" and has to
+      // mean it, whatever order the boxes were ticked in.
+      const order = zones().map((z) => z.id);
+      prog.zones.sort((a, b) => order.indexOf(a.uniqueId) - order.indexOf(b.uniqueId));
+    } else {
+      prog.zones = prog.zones.filter((z) => z.uniqueId !== zid);
+    }
+    // The minutes box belongs to the zone next to it, so it follows the tick.
+    const mins = document.querySelector('[data-ipmin="' + parts[0] + ":" + zid + '"]');
+    if (mins) mins.disabled = !ipz.checked;
+    markIrrDirty();
+    refreshProgramNote(Number(parts[0]));
+    return;
+  }
+  const ipmin = ev.target.closest("[data-ipmin]");
+  if (ipmin) {
+    const parts = ipmin.dataset.ipmin.split(":");
+    const entry = (irrigation.programs[Number(parts[0])].zones || []).find((z) => z.uniqueId === parts[1]);
+    if (entry) entry.minutes = Math.max(1, Math.min(240, parseInt(ipmin.value, 10) || 1));
+    markIrrDirty();
+    refreshProgramNote(Number(parts[0]));
+    return;
+  }
+  if (ev.target.id === "irr-enabled" || ev.target.id === "irr-rain" || ev.target.id === "irr-max") {
+    // Keep the model in step: the status card is redrawn on every SSE event and
+    // would otherwise put the select back to the stored value mid-edit.
+    if (ev.target.id === "irr-max") {
+      irrigation.maxConcurrentZones = parseInt(ev.target.value, 10) || 1;
+      // Both the zones note and every program summary state the rule in words, so
+      // they have to follow the number the moment it changes, not only on save.
+      renderIrrZones();
+      (irrigation.programs || []).forEach((_, i) => refreshProgramNote(i));
+    }
+    markIrrDirty();
+    return;
+  }
+  if (ev.target.id === "nf-driver") { onDriverChange(); return; }
+  if (ev.target.id === "nf-p1" || ev.target.id === "nf-p2") { onNewPinChange(); return; }
+  if (ev.target.id === "s-dhcp") { $("s-static").classList.toggle("hide", ev.target.checked); markDirty(); return; }
+  if (ev.target.closest("#v-system")) markDirty();
+});
+
+document.addEventListener("input", (ev) => {
+  if (ev.target.id === "s-nodeId") updateNameDirty();
+});
+
+window.addEventListener("beforeunload", (e) => {
+  if (dirty) { e.preventDefault(); e.returnValue = ""; }
+});
+
+document.addEventListener("DOMContentLoaded", () => {
+  applyTheme(currentTheme());        // paints the button for the theme already applied
+  $("toast-close").onclick = dismissToast;
+  $("theme-btn").onclick = () => applyTheme(currentTheme() === "light" ? "dark" : "light");
+  $("h-fw-link").onclick = openFirmwareSettings;
+  $("save-btn").onclick = save;
+  $("nf-add").onclick = addFeature;
+  $("a-export").onclick = exportConfig;
+  $("r-file").onchange = () => {
+    const file = ($("r-file").files || [])[0];
+    $("r-msg").className = "note";
+    $("r-msg").textContent = file
+      ? "Pronto para validar e aplicar " + file.name + "."
+      : "Escolhe uma cópia JSON EasyIot da mesma variante de equipamento.";
+  };
+  $("d-log-pause").onclick = (e) => {
+    logPaused = !logPaused;
+    e.target.textContent = logPaused ? "Retomar" : "Pausar";
+  };
+  $("d-log-clear").onclick = () => { logLines = []; $("d-log").innerHTML = ""; };
+  $("d-log-copy").onclick = () => {
+    navigator.clipboard.writeText(logLines.join("\n")).then(
+      () => toast("Registo copiado", "ok"), () => toast("Não foi possível copiar", "err"));
+  };
+  $("u-send").onclick = (e) => uploadFirmware(e.currentTarget);
+  $("u-list").onclick = (e) => listFirmwareVersions(e.currentTarget);
+  $("r-send").onclick = (e) => {
+    const f = ($("r-file").files || [])[0];
+    if (!f) {
+      $("r-msg").className = "note err";
+      $("r-msg").textContent = "Escolhe primeiro o ficheiro .json.";
+      return;
+    }
+    restoreConfig(f, e.currentTarget);
+  };
+  $("a-reboot").onclick = async (e) => {
+    if (!armed(e.currentTarget, "Reiniciar?")) return;
+    try { await api("/reboot", { method: "POST" }); toast("A reiniciar…", "ok"); } catch (err) { toast("Falhou", "err"); }
+  };
+  $("a-update").onclick = async (e) => {
+    if (!armed(e.currentTarget, "Atualizar?")) return;
+    try {
+      await api("/auto-update", { method: "POST" });
+      followUpdate();
+    } catch (err) { toast("Falhou o pedido de atualização", "err"); }
+  };
+  $("a-defaults").onclick = async (e) => {
+    if (!armed(e.currentTarget, "Apagar tudo?")) return;
+    try { await api("/load-defaults", { method: "POST" }); toast("A repor…", "ok"); } catch (err) { toast("Falhou", "err"); }
+  };
+  // Announce an available update on arrival; the old panel did and people
+  // relied on it to know a fix existed.
+  load().then(connectEvents).then(checkForUpdate);
+  $("d-devlog-refresh").onclick = loadDeviceLog;
+  $("d-devlog-copy").onclick = async (e) => {
+    try {
+      await navigator.clipboard.writeText($("d-devlog").innerText);
+      toast("Registo copiado", "ok");
+    } catch (err) {
+      toast("O browser não deixou copiar — seleciona e copia à mão", "err");
+    }
+  };
+
+  // Diagnostics are a snapshot; refresh them while the tab is open.
+  setInterval(() => {
+    if ($("v-diag").classList.contains("on")) {
+      api("/config").then((c) => { applyDiagnosticsSnapshot(c); renderHeader(); renderDiag(); }).catch(() => {});
+      // Left to the buttons otherwise: re-reading it under someone's cursor every
+      // ten seconds would move the text they are trying to select.
+    }
+  }, 10000);
+  // The remaining time is counted down here so the tile does not need a push
+  // every second; the device is re-asked now and then in case a program
+  // advanced to the next zone on its own.
+  setInterval(() => {
+    if (!irrigation || !$("v-irrigation").classList.contains("on")) return;
+    const run = irrigation.running;
+    let ticked = false;
+    if (run) {
+      runningZones(run).forEach((z) => {
+        if (z.secondsLeft > 0) {
+          z.secondsLeft -= 1;
+          ticked = true;
+        }
+      });
+      if (ticked) refreshIrrRunning();
+    }
+    Object.keys(zoneClocks).forEach((id) => {
+      if (zoneClocks[id].left > 0) {
+        zoneClocks[id].left -= 1;
+        ticked = true;
+      }
+    });
+    if (ticked) paintZoneClocks();
+  }, 1000);
+  setInterval(() => {
+    if (!irrigation || !$("v-irrigation").classList.contains("on") || irrDirty) return;
+    api("/config").then((c) => {
+      const before = irrShape(irrigation);
+      irrigation = c.irrigation || irrigation;
+      config.irrigation = irrigation;
+      // The device is the clock; the panel only counts between reads. Nothing
+      // else of a feature is copied over, so an unsaved edit in FUNÇÕES is safe.
+      (c.features || []).forEach((fresh) => {
+        const zone = (config.features || []).find((f) => f.id === fresh.id);
+        if (!zone || !isZone(zone)) return;
+        zone.state = fresh.state;
+        zone.value = fresh.value;
+        zone.secondsLeft = fresh.secondsLeft;
+        zone.totalSeconds = fresh.totalSeconds;
+        readZoneClock(zone);
+      });
+      // Valve states travel by event; only the cycle itself is re-read. Rebuilding
+      // the card costs nothing to look at and everything to use — it holds a
+      // select — so the countdown alone is corrected unless the shape moved.
+      if (irrShape(irrigation) === before) { refreshIrrRunning(); paintZoneClocks(); }
+      else { renderIrrStatus(); renderIrrZones(); }
+    }).catch(() => {});
+  }, 15000);
+});

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OnOfre</title>
+<link rel="stylesheet" href="css/styles.css?v=__ASSET_VERSION__">
+<script>/* Applied before the first paint, otherwise the page flashes the wrong theme. */
+try{var t=localStorage.getItem("onofre-theme")||(matchMedia("(prefers-color-scheme:light)").matches?"light":"dark");document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="brand">
+    <svg viewBox="0 0 69 67" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M9.93 67c-1.37 0-2.48-1.13-2.48-2.52V34.87c0-3.69 1.59-7.19 4.36-9.58l15.6-13.51c4.69-4.05 11.59-4.01 16.23.09l15.18 13.44a12.63 12.63 0 0 1 4.25 9.49v5.88c3.44 1.07 5.93 4.28 5.93 8.08a8.45 8.45 0 0 1-8.44 8.46 8.45 8.45 0 0 1-8.44-8.46c0-3.82 2.52-7.04 5.98-8.1v-5.86c0-2.18-.93-4.26-2.55-5.69L40.37 15.67a6.6 6.6 0 0 0-9.73-.05l-15.61 13.5a7.55 7.55 0 0 0-2.59 5.75v29.61c0 1.39-1.11 2.52-2.48 2.52Z" fill="currentColor"/><path d="M8.44 16.92a8.45 8.45 0 0 0 8.44-8.46A8.45 8.45 0 0 0 8.44 0 8.45 8.45 0 0 0 0 8.46a8.45 8.45 0 0 0 8.44 8.46Z" fill="currentColor"/></svg>
+    ONOFRE
+  </div>
+  <span class="hid"><b id="h-name">…</b> · <span id="h-chip"></span> · <span id="h-mcu"></span> ·
+    <button type="button" class="header-fw" id="h-fw-link" title="Firmware instalado" disabled>
+      <span>FW</span> <span class="notranslate" id="h-fw" translate="no">—</span>
+      <svg class="header-fw-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 19h14"/></svg>
+      <span class="notranslate header-fw-latest" id="h-fw-latest" translate="no"></span>
+      <svg class="header-fw-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 9v5m0 3h.01"/></svg>
+    </button>
+  </span>
+  <span class="spacer"></span>
+  <span class="pill" id="h-wifi">WiFi <b>—</b></span>
+  <span class="pill" id="h-mqtt">MQTT <b>—</b></span>
+  <span class="pill" id="h-up">ligado há <b>—</b></span>
+  <span class="dirty hide" id="dirty">por guardar</span>
+  <button class="btn ico" id="theme-btn" title="Mudar tema" aria-label="Mudar tema"></button>
+  <button class="btn p" id="save-btn" disabled>Guardar</button>
+</div>
+
+<div class="tabs">
+  <button class="tab on" data-view="overview">VISÃO GERAL</button>
+  <button class="tab" data-view="pinout">PINOUT</button>
+  <button class="tab" data-view="features">FUNÇÕES</button>
+  <button class="tab hide" data-view="irrigation" id="tab-irrigation">REGA</button>
+  <button class="tab" data-view="diag">DIAGNÓSTICO</button>
+  <button class="tab" data-view="system">SISTEMA</button>
+</div>
+
+<!-- ============ VISÃO GERAL ============ -->
+<div class="view on" id="v-overview"><div class="wrap">
+  <div class="sec">ACESSÓRIOS</div>
+  <div id="ov-actuators"></div>
+  <div class="sec" id="ov-sensors-title">SENSORES</div>
+  <div class="grid g3" id="ov-sensors"></div>
+</div></div>
+
+<!-- ============ PINOUT ============ -->
+<div class="view" id="v-pinout"><div class="wrap">
+  <div class="sec">MAPA DE PINOS</div>
+  <p class="note" style="margin:0 2px 12px">
+    Lido da própria placa. Um pino ocupado mostra a que função pertence; os reservados
+    não podem ser usados — a lista vem do firmware, não desta página.
+  </p>
+  <div class="board">
+    <div class="pinlist" id="pin-left"></div>
+    <div class="chip"><b id="pin-board">—</b><span id="pin-mcu"></span></div>
+    <div class="pinlist" id="pin-right"></div>
+  </div>
+  <div class="sec">PREDEFINIÇÕES</div>
+  <p class="note" style="margin:0 2px 10px">
+    Substituem a configuração de funções por um esquema pronto. Não afetam Wi-Fi nem MQTT.
+  </p>
+  <div class="btns" id="tpl-btns"></div>
+</div></div>
+
+<!-- ============ FUNÇÕES ============ -->
+<div class="view" id="v-features"><div class="wrap">
+  <div class="sec">ADICIONAR</div>
+  <div class="card feature-add">
+    <div class="feature-add-head">
+      <div>
+        <h3>Nova função</h3>
+        <p class="note">Escolhe o tipo e os pinos. A placa valida a configuração antes de a criar.</p>
+      </div>
+      <span class="feature-badge kind-new">NOVO</span>
+    </div>
+    <div class="feature-add-grid" id="nf-fields">
+      <div class="field">
+        <label>NOME</label>
+        <input id="nf-name" maxlength="23" placeholder="ex: Luz da cozinha">
+      </div>
+      <div class="field">
+        <label>TIPO</label>
+        <select id="nf-driver"></select>
+      </div>
+      <div class="field"><label id="nf-p1-lbl">PINO</label><select id="nf-p1"></select></div>
+      <div class="field" id="nf-p2-box"><label id="nf-p2-lbl">SEGUNDO PINO</label><select id="nf-p2"></select></div>
+      <div class="field hide" id="nf-leds-box"><label>NÚMERO DE LEDS</label><input type="number" id="nf-leds" min="1" max="600" value="60"></div>
+    </div>
+    <div class="feature-add-actions">
+      <div class="note" id="nf-msg"></div>
+      <button class="btn p" id="nf-add">Adicionar função</button>
+    </div>
+  </div>
+
+  <div class="feature-section-head">
+    <div class="sec">CONFIGURADAS</div>
+    <span class="feature-count" id="feat-count">0</span>
+  </div>
+  <div class="feature-grid" id="feat-list"></div>
+</div></div>
+
+<!-- ============ REGA ============ -->
+<div class="view" id="v-irrigation"><div class="wrap">
+  <div class="sec">ESTADO</div>
+  <div id="irr-status"></div>
+  <div class="sec">ZONAS</div>
+  <p class="note" id="irr-zones-note" style="margin:0 2px 10px"></p>
+  <div class="tiles" id="irr-zones"></div>
+  <div class="sec">PROGRAMAS</div>
+  <p class="note" style="margin:0 2px 10px">
+    Os programas correm no próprio equipamento, por isso continuam a regar se a
+    internet falhar. Um ciclo interrompido por falta de energia não é retomado.
+  </p>
+  <div id="irr-programs"></div>
+  <div class="btns" style="margin-top:12px">
+    <button class="btn" id="irr-add">Novo programa</button>
+    <button class="btn p" id="irr-save" disabled>Guardar programas</button>
+  </div>
+  <div class="note" id="irr-msg"></div>
+</div></div>
+
+<!-- ============ DIAGNÓSTICO ============ -->
+<div class="view" id="v-diag"><div class="wrap">
+  <div class="grid g2">
+    <div class="card status-card off">
+      <h4>MEMÓRIA LIVRE</h4>
+      <div class="big" id="d-heap">—</div>
+      <svg class="spark" id="d-heap-spark" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
+      <div class="note" id="d-heap-note"></div>
+    </div>
+    <div class="card status-card off">
+      <h4>SISTEMA</h4>
+      <div class="kv"><span>último arranque</span><b id="d-reset">—</b></div>
+      <div class="kv"><span>ligado há</span><b id="d-uptime">—</b></div>
+      <div class="kv"><span>firmware</span><b class="kv-wrap notranslate" id="d-fw" translate="no">—</b></div>
+      <div class="kv"><span>programa</span><b id="d-sketch">—</b></div>
+    </div>
+    <div class="card status-card" id="d-net-card">
+      <div class="diag-card-head"><h4>REDE</h4><span class="status-badge health-badge off" id="d-net-status">—</span></div>
+      <div class="kv"><span>rede</span><b id="d-ssid">—</b></div>
+      <div class="kv"><span>sinal</span><b id="d-rssi">—</b></div>
+      <div class="kv"><span>IP</span><b id="d-ip">—</b></div>
+      <div class="kv"><span>máscara / gateway</span><b id="d-net">—</b></div>
+    </div>
+    <div class="card status-card" id="d-links-card">
+      <h4>LIGAÇÕES</h4>
+      <div class="kv"><span>MQTT local</span><b class="status-badge health-badge off" id="d-mqtt">—</b></div>
+      <div class="kv"><span>servidor</span><b id="d-broker">—</b></div>
+      <div class="kv"><span>cloud</span><b class="status-badge health-badge off" id="d-cloud">—</b></div>
+      <div class="kv"><span>relógio</span><b class="status-badge health-badge off" id="d-clock">—</b></div>
+    </div>
+  </div>
+  <div class="sec">REGISTO DO EQUIPAMENTO</div>
+  <p class="note" style="margin:0 0 9px">O que o equipamento registou desde que arrancou:
+    rede, cloud, atualizações e ciclos de rega. Vive na memória dele, por isso
+    recomeça a cada reinício — e é isto que interessa colar num relato.</p>
+  <div class="log" id="d-devlog"><div class="dim">a ler…</div></div>
+  <div class="btns" style="margin-top:9px">
+    <button class="btn" id="d-devlog-refresh">Atualizar</button>
+    <button class="btn" id="d-devlog-copy">Copiar</button>
+  </div>
+
+  <div class="sec">REGISTO AO VIVO</div>
+  <div class="log" id="d-log"><div class="dim">à espera de eventos…</div></div>
+  <div class="btns" style="margin-top:9px">
+    <button class="btn" id="d-log-pause">Pausar</button>
+    <button class="btn" id="d-log-copy">Copiar</button>
+    <button class="btn" id="d-log-clear">Limpar</button>
+  </div>
+</div></div>
+
+<!-- ============ SISTEMA ============ -->
+<div class="view" id="v-system"><div class="wrap">
+  <div class="system-tabs" role="tablist" aria-label="Definições do sistema">
+    <button type="button" class="system-tab on" role="tab" aria-selected="true" aria-controls="system-general" data-system-view="general">GERAL</button>
+    <button type="button" class="system-tab" role="tab" aria-selected="false" aria-controls="system-network" data-system-view="network">REDE</button>
+    <button type="button" class="system-tab" role="tab" aria-selected="false" aria-controls="system-access" data-system-view="access">ACESSO E CÓPIA</button>
+    <button type="button" class="system-tab" role="tab" aria-selected="false" aria-controls="system-firmware" data-system-view="firmware">FIRMWARE</button>
+  </div>
+
+  <div class="system-pane on" id="system-general" role="tabpanel">
+  <div class="system-section-head"><div class="sec">IDENTIFICAÇÃO</div>
+    <span class="status-badge warn hide" id="s-name-dirty">ALTERADO</span></div>
+  <div class="card"><div class="field"><label>NOME DO DISPOSITIVO</label>
+    <input id="s-nodeId" maxlength="30" placeholder="ex: Sala"></div></div>
+  </div>
+
+  <div class="system-pane" id="system-network" role="tabpanel">
+  <div class="sec">WI-FI</div>
+  <div class="card">
+    <div class="field"><label>REDE (SSID)</label><input id="s-ssid" maxlength="23"></div>
+    <div class="field"><label>PALAVRA-PASSE</label><input id="s-wpw" type="password" maxlength="63"></div>
+    <div class="field"><label><input type="checkbox" id="s-dhcp"> obter IP automaticamente (DHCP)</label></div>
+    <div class="field hide" id="s-antenna-box"><label>ANTENA (XIAO ESP32-C6)</label>
+      <select id="s-antenna">
+        <option value="0">não gerir — outras placas C6</option>
+        <option value="1">interna (cerâmica)</option>
+        <option value="2">externa (conector U.FL)</option>
+      </select></div>
+    <div id="s-static" class="hide">
+      <div class="field"><label>IP</label><input id="s-ip" maxlength="15"></div>
+      <div class="row2">
+        <div class="field"><label>MÁSCARA</label><input id="s-mask" maxlength="15"></div>
+        <div class="field"><label>GATEWAY</label><input id="s-gw" maxlength="15"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec">MQTT LOCAL</div>
+  <div class="card">
+    <div class="row2">
+      <div class="field"><label>SERVIDOR</label><input id="s-mqttHost" maxlength="39"></div>
+      <div class="field"><label>PORTA</label><input id="s-mqttPort" type="number" min="1" max="65535"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>UTILIZADOR</label><input id="s-mqttUser" maxlength="31"></div>
+      <div class="field"><label>PALAVRA-PASSE</label><input id="s-mqttPw" type="password" maxlength="63"></div>
+    </div>
+  </div>
+  </div>
+
+  <div class="system-pane" id="system-access" role="tabpanel">
+  <div class="sec">ACESSO A ESTE PAINEL</div>
+  <div class="card">
+    <div class="row2">
+      <div class="field"><label>UTILIZADOR</label><input id="s-apiUser" maxlength="31"></div>
+      <div class="field"><label>PALAVRA-PASSE</label><input id="s-apiPw" type="password" maxlength="63"></div>
+    </div>
+    <div class="note">Deixa a palavra-passe em branco para a manter como está.</div>
+  </div>
+
+  <div class="sec">CÓPIA DE CONFIGURAÇÃO</div>
+  <div class="card">
+    <p class="note" style="margin:0 0 11px">
+      Cria uma cópia completa das funções, sensores, nomes, pinos, tempos, KNX e
+      programas de rega. Não inclui palavras-passe. Num equipamento de substituição,
+      configura primeiro a mesma rede Wi-Fi e a respetiva palavra-passe.
+    </p>
+    <div class="btns"><button class="btn" id="a-export">Exportar configuração</button></div>
+    <div class="field" style="margin:11px 0 0"><label>RESTAURAR DE UM FICHEIRO</label>
+      <input type="file" id="r-file" accept=".json,application/json"></div>
+    <div class="btns"><button class="btn" id="r-send">Aplicar configuração</button></div>
+    <div class="note" id="r-msg">Escolhe uma cópia JSON EasyIot da mesma variante de equipamento.</div>
+  </div>
+  </div>
+
+  <div class="system-pane" id="system-firmware" role="tabpanel">
+  <div class="sec">ATUALIZAR POR FICHEIRO</div>
+  <div class="card">
+    <p class="note" style="margin:0 0 11px">
+      Envia um <b>.bin</b> diretamente para o dispositivo, sem passar pela cloud — é a via
+      de recurso quando não há internet. Tem de ser a imagem da variante
+      <b id="u-mcu">—</b>: outra qualquer deixa o dispositivo inacessível e só se recupera
+      por cabo USB. Não desligues a corrente durante o envio.
+    </p>
+    <div class="btns" style="margin-bottom:11px">
+      <button class="btn" id="u-list">Ver versões disponíveis</button>
+    </div>
+    <div id="u-versions"></div>
+    <div class="field"><input type="file" id="u-file" accept=".bin"></div>
+    <div class="bar hide" id="u-bar"><i style="width:0%"></i></div>
+    <div class="btns" style="margin-top:10px"><button class="btn" id="u-send">Enviar firmware</button></div>
+    <div class="note" id="u-msg"></div>
+  </div>
+
+  <div class="sec">AÇÕES</div>
+  <p class="note" style="margin:0 0 8px">
+    Atenção: <b>Procurar atualização</b> instala o firmware <b>oficial</b> da OnOfre, que não tem a fita LED.
+    Para atualizar este firmware usa <b>Atualizar por ficheiro</b>, acima.
+  </p>
+  <div class="btns">
+    <button class="btn" id="a-reboot">Reiniciar</button>
+    <button class="btn" id="a-update">Procurar atualização</button>
+    <button class="btn d" id="a-defaults">Repor de origem</button>
+  </div>
+  <div class="note" id="u-avail"></div>
+  <div class="bar hide" id="ota-bar" role="progressbar" aria-label="Progresso da atualização" aria-valuemin="0" aria-valuemax="100"><i style="width:0"></i></div>
+  <div class="note" id="ota-msg"></div>
+  <div class="note">Repor de origem apaga tudo: funções, Wi-Fi e MQTT.</div>
+  </div>
+</div></div>
+
+<div id="toast" role="status" aria-live="polite" aria-atomic="true">
+  <span id="toast-msg"></span>
+  <button id="toast-close" type="button" aria-label="Fechar notificação">&times;</button>
+</div>
+<script src="js/index.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>
