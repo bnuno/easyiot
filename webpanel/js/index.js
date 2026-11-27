@@ -932,7 +932,8 @@ const LED_DYN_START = 46;
 const LED_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">' +
   '<rect x="2" y="8.5" width="20" height="7" rx="3.5"/><circle cx="7" cy="12" r=".9" fill="currentColor"/>' +
   '<circle cx="12" cy="12" r=".9" fill="currentColor"/><circle cx="17" cy="12" r=".9" fill="currentColor"/></svg>';
-let ledState = null, ledBusy = 0, ledTimer = null, ledOn = false, ledSeg = -1, ledSig = "", ledPeekRaf = 0;
+let ledState = null, ledBusy = 0, ledTimer = null, ledSyncTimer = null, ledOn = false, ledSeg = -1, ledSig = "", ledPeekRaf = 0;
+const LED_NON_COLOR_FX = ["Rainbow", "Fire", "Color Cycle", "Theater Rainbow", "Plasma", "Confetti", "Police", "Juggle", "Bouncing Balls", "Fireworks", "Pacifica", "Colorwaves"];
 const ledHex = (c) => "#" + [c.r, c.g, c.b].map((x) => (x | 0).toString(16).padStart(2, "0")).join("");
 const ledRgb = (h) => ({ r: parseInt(h.substr(1, 2), 16), g: parseInt(h.substr(3, 2), 16), b: parseInt(h.substr(5, 2), 16) });
 function ledTarget() {
@@ -1307,28 +1308,88 @@ function ledFill(s) {
   $("led-info").textContent = "GPIO" + s.pin + " · " + s.leds + " LEDs · " + s.segs.length + (s.segs.length === 1 ? " segmento" : " segmentos");
   $("led-msg").textContent = "";
 }
+function ledApplyOptimistic(o) {
+  if (o.state !== undefined && o.seg === undefined) ledPower(o.state === "ON");
+  if (!ledState) return;
+  if (o.brightness !== undefined && o.seg === undefined) ledState.brightness = o.brightness;
+  if (o.leds !== undefined) ledState.leds = o.leds;
+  if (o.pattern !== undefined) ledState.pattern = o.pattern;
+  if (o.preset !== undefined) ledState.preset = o.preset;
+  if (o.bootPreset !== undefined) ledState.bootPreset = o.bootPreset;
+  if (o.transition !== undefined) ledState.transition = o.transition;
+  if (o.limit !== undefined) ledState.limit = o.limit;
+  if (o.maPerLed !== undefined) ledState.maPerLed = o.maPerLed;
+  if (o.colorOrder !== undefined) ledState.colorOrder = o.colorOrder;
+  if (o.gamma !== undefined) ledState.gamma = o.gamma;
+  if (o.cal !== undefined) ledState.cal = o.cal;
+  if (Array.isArray(ledState.segs)) {
+    const from = o.seg !== undefined ? o.seg : 0;
+    const to = o.seg !== undefined ? o.seg : ledState.segs.length - 1;
+    const bareColor = o.color !== undefined && o.palette === undefined && o.effect === undefined &&
+      o.color2 === undefined && o.color3 === undefined;
+    for (let i = from; i <= to; i++) {
+      const g = ledState.segs[i];
+      if (!g) continue;
+      if (o.seg !== undefined && o.state !== undefined) {
+        g.on = o.state === "ON";
+        if ($("led-segpw") && ledTarget() === i) {
+          $("led-segpw").textContent = g.on ? "Desligar este segmento" : "Ligar este segmento";
+        }
+      }
+      if (o.seg !== undefined && o.brightness !== undefined) g.brightness = o.brightness;
+      if (o.color !== undefined) g.color = o.color;
+      if (o.color2 !== undefined) g.color2 = o.color2;
+      if (o.color3 !== undefined) g.color3 = o.color3;
+      if (o.speed !== undefined) g.speed = o.speed;
+      if (o.intensity !== undefined) g.intensity = o.intensity;
+      if (o.reverse !== undefined) g.reverse = !!o.reverse;
+      if (o.mirror !== undefined) g.mirror = !!o.mirror;
+      if (o.grouping !== undefined) g.grouping = o.grouping;
+      if (o.spacing !== undefined) g.spacing = o.spacing;
+      if (o.offset !== undefined) g.offset = o.offset;
+      if (o.effect !== undefined) g.effect = o.effect;
+      if (o.palette !== undefined) g.paletteId = +o.palette;
+      if (bareColor) {
+        if (g.paletteId > 0 && g.paletteId < LED_DYN_START) g.paletteId = 0;
+        if (LED_NON_COLOR_FX.indexOf(g.effect) >= 0) g.effect = "Static";
+      }
+    }
+    if (ledState.segs[0]) {
+      ledState.color = ledState.segs[0].color;
+      ledState.effect = ledState.segs[0].effect;
+      ledState.paletteId = ledState.segs[0].paletteId;
+    }
+  }
+  ledTileUpdate();
+}
 function ledShow(s, all, force) {
   if (force || Date.now() - ledBusy > 1200) { ledState = s; ledOn = !!s.on; } else if (ledState) { ledState.pin = s.pin; ledState.leds = s.leds; }
   ledTileUpdate();
   if (all) ledFill(s);
 }
 async function ledGet() {
-  try { ledShow(await api("/ledstate"), Date.now() - ledBusy > 1500, false); }
+  const reqAt = Date.now();
+  try {
+    const s = await api("/ledstate");
+    if (ledBusy > reqAt) return;
+    ledShow(s, Date.now() - ledBusy > 1500, false);
+  }
   catch (e) { const m = $("led-msg"); if (m) m.textContent = "Sem resposta da fita."; }
 }
 function ledSend(o, now) {
   clearTimeout(ledTimer);
+  clearTimeout(ledSyncTimer);
   ledBusy = Date.now();
-  if (o.state && o.seg === undefined) ledPower(o.state === "ON");
+  ledApplyOptimistic(o);
   const go = async () => {
+    ledBusy = Date.now();
     try {
-      ledShow(await api("/led/set", { method: "POST", body: JSON.stringify(o) }), false, true);
-      if (o.segments || o.leds !== undefined || o.limit !== undefined || o.maPerLed !== undefined ||
-          o.pattern !== undefined || o.preset !== undefined || o.savePreset !== undefined || o.nightlight !== undefined) {
-        setTimeout(() => { ledBusy = 0; ledGet(); }, 350);
-      }
+      ledShow(await api("/led/set", { method: "POST", body: JSON.stringify(o) }), false, false);
+      ledSyncTimer = setTimeout(() => { ledBusy = 0; ledGet(); }, 250);
     }
     catch (e) {
+      ledBusy = 0;
+      ledGet();
       const m = $("led-msg");
       if (m) m.textContent = e && e.status === 409 ? "A fita ainda está a arrancar — tenta daqui a uns segundos." : "Não foi possível comandar a fita.";
     }
