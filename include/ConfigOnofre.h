@@ -1,5 +1,6 @@
 #pragma once
 #include "LedStrip.h"
+#include "Boiler.h"
 #include "Constants.h"
 #include "Utils.hpp"
 #include <ArduinoJson.h>
@@ -221,8 +222,8 @@ public:
     case SensorDriver::SHT4X:
     case SensorDriver::TMF882X:
     case SensorDriver::LDC1612:
-      // I2C: both slots are bus lines, so both have to be drivable.
-      return slot < 2 && validOutputPin(pin);
+      // I2C: Smart Bus pins (DefaultPins::SDA/SCL) may not be in outputInputPins (e.g. classic ESP32 GPIO32/33).
+      return slot < 2 && (validOutputPin(pin) || pin == static_cast<unsigned int>(DefaultPins::SDA) || pin == static_cast<unsigned int>(DefaultPins::SCL));
     case SensorDriver::INVALID_SENSOR:
     default:
       return false;
@@ -257,6 +258,8 @@ public:
           return true;
     }
     if (ledStripUsesPin(pin))
+      return true;
+    if (boilerUsesPin(pin))
       return true;
     return false;
   }

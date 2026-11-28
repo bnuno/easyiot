@@ -36,6 +36,9 @@ const DRIVERS = [
   { g: "Iluminação LED", items: [
     { v: 200, t: "LED_STRIP", n: "Fita LED (WS2812 / WS2813 / WS2815)", pins: 1 },
   ]},
+  { g: "Aquecimento e Clima", items: [
+    { v: 201, t: "BOILER", n: "Aquecimento Central (Caldeira)", pins: 2, l: ["PINO 1-WIRE (DS18B20)", "PINO BOMBA (RELÉ)"] },
+  ]},
   { g: "Sensores", items: [
     { v: 111, t: "DHT_11", n: "DHT11 · temperatura e humidade", pins: 1 },
     { v: 121, t: "DHT_21", n: "DHT21 · temperatura e humidade", pins: 1 },
@@ -79,7 +82,7 @@ function driverLabel(token) {
 const TEMPLATES = [
   { v: 1, n: "Duas luzes" }, { v: 2, n: "Duas tomadas" }, { v: 3, n: "Estore" },
   { v: 4, n: "Portão" }, { v: 5, n: "Contador HAN" }, { v: 6, n: "Rega" },
-  { v: 7, n: "Contador de água" },
+  { v: 7, n: "Contador de água" }, { v: 9, n: "Aquecimento Central" }, { v: 10, n: "Termostato" },
 ];
 
 /* Inline so the panel keeps working with no network: an icon set is the first
@@ -871,7 +874,7 @@ function renderOverview() {
   // Tiles rather than full-width rows: an accessory is a small thing and reads
   // better as a grid, the way a phone's home app lays them out. Each tile is
   // wrapped because the cog cannot live inside the button that toggles it.
-  $("ov-actuators").innerHTML = (acts.length || config.ledStrip) ? '<div class="tiles">' + acts.map((f) => {
+  $("ov-actuators").innerHTML = (acts.length || config.ledStrip || config.boiler) ? '<div class="tiles">' + acts.map((f) => {
     const state = parseInt(f.state, 10) || 0;
     const pins = (f.outputs || []).length ? "OUT " + f.outputs.join(",") : "";
     const ins = (f.inputs || []).length ? "IN " + f.inputs.join(",") : "";
@@ -897,9 +900,11 @@ function renderOverview() {
         '<span class="tile-sub">' + tileAction(state > 0) + "</span>" +
         meta + "</button>";
     return '<div class="tile-wrap">' + body + cog + "</div>";
-  }).join("") + ledTile() + "</div>" : '<div class="note">Sem acessórios configurados.</div>';
+  }).join("") + ledTile() + (typeof boilerTile === "function" ? boilerTile() : "") + "</div>" : '<div class="note">Sem acessórios configurados.</div>';
 
   ledSync();
+  if (typeof boilerSync === "function") boilerSync();
+  if (typeof thermostatSync === "function") thermostatSync();
 
   $("ov-sensors-title").classList.toggle("hide", !sens.length);
   $("ov-sensors").innerHTML = sens.map((f) => isEnergy(f) ? energyCard(f) :
@@ -1596,6 +1601,682 @@ setInterval(() => {
   if (typeof config !== "undefined" && config && config.ledStrip && !document.hidden &&
       Date.now() - ledBusy > 1500) ledGet();
 }, 3000);
+/* ---------------- Aquecimento Central (Caldeira) ---------------- */
+var boilerState = null;
+var boilerBusy = 0;
+var boilerTimer = null;
+var boilerSyncTimer = null;
+var boilerOn = false;
+
+const BOILER_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M12 2c.5 3.5-2.5 5-2.5 8 0 1.8 1.2 3 2.5 3s2.5-1.2 2.5-3c0-1.4-.6-2.5-1.2-3.5 2.5 1.4 4.2 4 4.2 6.8a5.5 5.5 0 1 1-11 0C6.5 9.8 8.8 5.2 12 2Z"/></svg>';
+
+function boilerFmtT(v) {
+  return (v == null || isNaN(Number(v))) ? "--.-C" : Number(v).toFixed(1) + "C";
+}
+
+function boilerTileSubtitle(s) {
+  if (!s) return boilerOn ? "a carregar estado..." : "desligada";
+  const parts = [];
+  if (s.tempWater != null) parts.push("Água " + Number(s.tempWater).toFixed(1) + "°");
+  else parts.push("Água --.-°");
+  if (s.tempReturn != null) parts.push("Ret " + Number(s.tempReturn).toFixed(1) + "°");
+  if (s.on) {
+    parts.push("Bomba " + (s.pump ? "ON" : "OFF"));
+    parts.push("Res " + (s.heater ? "ON" : "OFF"));
+  } else {
+    parts.push("Standby");
+  }
+  return parts.join(" · ");
+}
+
+function boilerTile() {
+  const b = config.boiler;
+  if (!b) return "";
+  const s = boilerState;
+  const on = s ? !!s.on : false;
+  boilerOn = on;
+  const meta = s
+    ? Number(s.totalKw || 0).toFixed(2) + " kW · " + Number(s.kwhTotal || 0).toFixed(2) + " kWh · 1W GPIO" + b.dallas
+    : "Bomba GPIO" + b.pump + " · Resist GPIO" + b.heater + " · 1W GPIO" + b.dallas;
+  return '<div class="tile-wrap"><button type="button" class="tile tap' + (on ? " on" : "") +
+    '" data-boiler-toggle="1" aria-pressed="' + on + '" aria-label="' + tileAction(on) + " " + esc(b.name) + '">' +
+    '<span class="tile-top">' + BOILER_ICON + "</span><b>" + esc(b.name) + "</b>" +
+    '<span class="tile-sub" id="bl-tile-sub">' + esc(boilerTileSubtitle(s)) + "</span>" +
+    '<span class="tile-pins" id="bl-tile-pins">' + esc(meta) + "</span></button>" +
+    '<button type="button" class="cog" data-boiler-cog="1" title="Configurar Caldeira" aria-label="Configurar ' +
+    esc(b.name) + '">' + COG + "</button></div>";
+}
+
+function boilerSync() {
+  if (!config.boiler) { boilerCloseModal(); boilerState = null; return; }
+  if (!boilerState) boilerGet();
+}
+
+function boilerTileUpdate() {
+  const t = document.querySelector("[data-boiler-toggle]");
+  if (!t) return;
+  t.classList.toggle("on", boilerOn);
+  t.setAttribute("aria-pressed", String(boilerOn));
+  const sub = $("bl-tile-sub");
+  if (sub) sub.textContent = boilerTileSubtitle(boilerState);
+  const pins = $("bl-tile-pins");
+  if (pins && boilerState && config.boiler) {
+    pins.textContent = Number(boilerState.totalKw || 0).toFixed(2) + " kW · " +
+      Number(boilerState.kwhTotal || 0).toFixed(2) + " kWh · 1W GPIO" + config.boiler.dallas;
+  }
+}
+
+function boilerLcdLines(s) {
+  const pad20 = (t) => String(t).slice(0, 20).padEnd(20, " ");
+  const menu = s.menu || 0;
+  if (menu === 0) {
+    const tw = boilerFmtT(s.tempWater), tr = boilerFmtT(s.tempReturn), ts = boilerFmtT(s.roomTemp);
+    const l3 = s.on
+      ? "Bomba:" + (s.pump ? "ON " : "OFF") + " Resist:" + (s.heater ? "ON " : "OFF")
+      : "SISTEMA: STANDBY";
+    return [
+      pad20("   MENU PRINCIPAL"),
+      pad20("Agua:" + tw + " Ret:" + tr),
+      pad20("Sala:" + ts + " Set:" + Number(s.spRoom ?? 21).toFixed(1) + "C"),
+      pad20(l3),
+    ];
+  }
+  const titles = [
+    "",
+    "Setpoint Resistencia",
+    "Setpoint Bomba",
+    "Setpoint Sala",
+    "Diferencial Resist.",
+    "Diferencial Bomba",
+    "Diferencial Sala",
+  ];
+  const vals = [
+    "",
+    Number(s.spHeater ?? 50).toFixed(0) + " C",
+    Number(s.spPump ?? 30).toFixed(0) + " C",
+    Number(s.spRoom ?? 21).toFixed(1) + " C",
+    Number(s.diffHeater ?? 3).toFixed(0) + " C",
+    Number(s.diffPump ?? 3).toFixed(0) + " C",
+    Number(s.diffRoom ?? 0.5).toFixed(1) + " C",
+  ];
+  return [
+    pad20("    CONFIGURACAO"),
+    pad20(titles[menu] || ""),
+    pad20("Valor: " + (vals[menu] || "")),
+    pad20("Botoes: [-]  [+]"),
+  ];
+}
+
+function boilerFill(s) {
+  if (!$("boiler-modal") || !s) return;
+  const lcd = $("bl-lcd");
+  if (lcd) lcd.textContent = boilerLcdLines(s).join("\n");
+  const pw = $("bl-pw-btn");
+  if (pw) {
+    pw.textContent = s.on ? "Sistema LIGADO (Desligar)" : "Sistema em STANDBY (Ligar)";
+    pw.className = "btn " + (s.on ? "p" : "");
+  }
+  const pb = $("bl-pump-badge");
+  if (pb) { pb.textContent = s.pump ? "Bomba LIGADA" : "Bomba Desligada"; pb.className = "feature-badge " + (s.pump ? "kind-actuator" : ""); }
+  const hb = $("bl-heat-badge");
+  if (hb) { hb.textContent = s.heater ? "Resistência LIGADA" : "Resistência Desligada"; hb.className = "feature-badge " + (s.heater ? "kind-cover" : ""); }
+  if ($("bl-tw")) $("bl-tw").textContent = s.tempWater != null ? Number(s.tempWater).toFixed(1) + " °C" : "Erro / Desligada";
+  if ($("bl-tr")) $("bl-tr").textContent = s.tempReturn != null ? Number(s.tempReturn).toFixed(1) + " °C" : "Erro / Desligada";
+  if ($("bl-ts")) $("bl-ts").textContent = Number(s.roomTemp ?? 20).toFixed(1) + " °C";
+  if ($("bl-pwr")) $("bl-pwr").textContent = Number(s.totalKw || 0).toFixed(2) + " kW (" + (s.heaterWatts || 0) + "W + " + (s.pumpWatts || 0) + "W)";
+  if ($("bl-kwh")) $("bl-kwh").textContent = "Res: " + Number(s.kwhHeater || 0).toFixed(3) + " kWh · Bomba: " +
+    Number(s.kwhPump || 0).toFixed(3) + " kWh · Total: " + Number(s.kwhTotal || 0).toFixed(3) + " kWh";
+
+  const bindNum = (id, lblId, val, dec, unit) => {
+    const el = $(id), lb = $(lblId);
+    if (el && document.activeElement !== el) el.value = val;
+    if (lb) lb.textContent = Number(val).toFixed(dec) + unit;
+  };
+  bindNum("bl-spH", "bl-spHv", s.spHeater ?? 50, 0, " °C");
+  bindNum("bl-dH", "bl-dHv", s.diffHeater ?? 3, 0, " °C");
+  bindNum("bl-spP", "bl-spPv", s.spPump ?? 30, 0, " °C");
+  bindNum("bl-dP", "bl-dPv", s.diffPump ?? 3, 0, " °C");
+  bindNum("bl-spR", "bl-spRv", s.spRoom ?? 21, 1, " °C");
+  bindNum("bl-dR", "bl-dRv", s.diffRoom ?? 0.5, 1, " °C");
+  if ($("bl-rt") && document.activeElement !== $("bl-rt")) $("bl-rt").value = Number(s.roomTemp ?? 20).toFixed(1);
+  if ($("bl-lcd-st")) {
+    $("bl-lcd-st").textContent = s.lcdOk
+      ? "LCD 20×4 detetado em 0x" + ((config.boiler && config.boiler.lcdAddr) ? config.boiler.lcdAddr.toString(16).toUpperCase() : "27")
+      : "LCD I2C não detetado (ou sem ligação no barramento)";
+  }
+  if ($("bl-espnow-st")) {
+    const macTxt = s.ownMac ? ("MAC Caldeira: " + s.ownMac + " · Canal " + (s.wifiChannel || 0)) : "";
+    const rxTxt = (s.espNowRxAgoSec != null && s.espNowRxAgoSec >= 0)
+      ? (" · ESP-NOW Sala OK há " + s.espNowRxAgoSec + "s (" + (s.espNowSenderMac || "") + ")")
+      : " · A aguardar Termostato ESP-NOW";
+    $("bl-espnow-st").textContent = macTxt + rxTxt;
+  }
+  if ($("bl-msg")) $("bl-msg").textContent = "";
+}
+
+function boilerApplyOptimistic(o) {
+  if (!boilerState) boilerState = Object.assign({ on: boilerOn, spHeater: 50, spPump: 30, spRoom: 21, diffHeater: 3, diffPump: 3, diffRoom: 0.5, roomTemp: 20 }, config.boiler || {});
+  if (o.state !== undefined) { boilerOn = o.state === "ON"; boilerState.on = boilerOn; }
+  if (o.on !== undefined) { boilerOn = !!o.on; boilerState.on = boilerOn; }
+  ["spHeater", "spPump", "spRoom", "diffHeater", "diffPump", "diffRoom", "roomTemp"].forEach((k) => {
+    if (o[k] !== undefined) boilerState[k] = Number(o[k]);
+  });
+  if (o.resetEnergy) { boilerState.kwhHeater = 0; boilerState.kwhPump = 0; boilerState.kwhTotal = 0; }
+  boilerTileUpdate();
+  boilerFill(boilerState);
+}
+
+function boilerShow(s, all, force) {
+  if (!s) return;
+  if (force || Date.now() - boilerBusy > 1200) {
+    boilerState = s;
+    boilerOn = !!s.on;
+  } else if (boilerState) {
+    boilerState.probes = s.probes;
+    boilerState.lcdOk = s.lcdOk;
+    boilerState.romW = s.romW;
+    boilerState.romR = s.romR;
+  }
+  boilerTileUpdate();
+  if (all) boilerFill(boilerState);
+  boilerUpdateProbeSelects();
+}
+
+async function boilerGet() {
+  const reqAt = Date.now();
+  try {
+    const s = await api("/boilerstate");
+    if (boilerBusy > reqAt) return;
+    boilerShow(s, Date.now() - boilerBusy > 1500, false);
+  } catch (e) {
+    if ($("bl-msg")) $("bl-msg").textContent = "Sem resposta do controlador da caldeira.";
+  }
+}
+
+function boilerSend(o, now) {
+  clearTimeout(boilerTimer);
+  clearTimeout(boilerSyncTimer);
+  boilerBusy = Date.now();
+  boilerApplyOptimistic(o);
+  const go = async () => {
+    boilerBusy = Date.now();
+    try {
+      boilerShow(await api("/boiler/set", { method: "POST", body: JSON.stringify(o) }), false, false);
+      boilerSyncTimer = setTimeout(() => { boilerBusy = 0; boilerGet(); }, 250);
+    } catch (e) {
+      boilerBusy = 0;
+      boilerGet();
+      if ($("bl-msg")) $("bl-msg").textContent = "Não foi possível enviar o comando para a caldeira.";
+    }
+  };
+  if (now) go(); else boilerTimer = setTimeout(go, 90);
+}
+
+function boilerOpenModal() {
+  if ($("boiler-modal") || !config.boiler) return;
+  const bg = document.createElement("div");
+  bg.className = "modal-bg";
+  bg.id = "boiler-modal";
+  bg.innerHTML =
+    '<div class="modal" role="dialog" aria-modal="true" aria-label="' + esc(config.boiler.name) + '">' +
+    '<div class="modal-head"><b>' + esc(config.boiler.name) + ' · Aquecimento Central</b>' +
+    '<button type="button" class="modal-x" data-boiler-close="1" aria-label="Fechar">×</button></div>' +
+    '<pre id="bl-lcd" style="margin:0 0 10px;padding:10px 12px;border-radius:8px;background:#0a2a1e;color:#7ef9c0;border:2px solid #1b4d3e;font:600 13px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-x:auto">   MENU PRINCIPAL\nAgua:--.-C Ret:--.-C\nSala:--.-C Set:21.0C\nSISTEMA: STANDBY</pre>' +
+    '<div class="note" id="bl-lcd-st" style="margin:0 0 4px"></div>' +
+    '<div class="note" id="bl-espnow-st" style="margin:0 0 10px;font-family:ui-monospace,monospace"></div>' +
+    '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px">' +
+      '<button type="button" class="btn" id="bl-pw-btn" data-boiler-toggle="1">Ligar / Desligar</button>' +
+      '<span class="feature-badge" id="bl-pump-badge">Bomba —</span>' +
+      '<span class="feature-badge" id="bl-heat-badge">Resistência —</span>' +
+    '</div>' +
+    '<div class="row2" style="grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">' +
+      '<div class="card" style="padding:10px"><div class="sub" style="margin:0 0 2px">ÁGUA CALDEIRA</div><b id="bl-tw">—</b></div>' +
+      '<div class="card" style="padding:10px"><div class="sub" style="margin:0 0 2px">ÁGUA RETORNO</div><b id="bl-tr">—</b></div>' +
+      '<div class="card" style="padding:10px"><div class="sub" style="margin:0 0 2px">SALA</div><b id="bl-ts">—</b></div>' +
+    '</div>' +
+    '<div class="card" style="padding:10px 12px;margin-bottom:12px">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">' +
+        '<div><div class="sub" style="margin:0">POTÊNCIA & ENERGIA HOJE</div>' +
+        '<div style="font-size:13px;font-weight:600" id="bl-pwr">0.00 kW</div>' +
+        '<div class="note" id="bl-kwh" style="margin:2px 0 0"></div></div>' +
+        '<button type="button" class="btn d" data-boiler-reset="1">Zerar Energia Hoje</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>SETPOINT RESISTÊNCIA <span id="bl-spHv"></span></label><input type="range" id="bl-spH" min="40" max="60" step="1"></div>' +
+      '<div class="field"><label>DIFERENCIAL RESISTÊNCIA <span id="bl-dHv"></span></label><input type="range" id="bl-dH" min="1" max="10" step="1"></div>' +
+    '</div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>SETPOINT BOMBA <span id="bl-spPv"></span></label><input type="range" id="bl-spP" min="20" max="60" step="1"></div>' +
+      '<div class="field"><label>DIFERENCIAL BOMBA <span id="bl-dPv"></span></label><input type="range" id="bl-dP" min="1" max="10" step="1"></div>' +
+    '</div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>SETPOINT SALA <span id="bl-spRv"></span></label><input type="range" id="bl-spR" min="16" max="30" step="0.5"></div>' +
+      '<div class="field"><label>DIFERENCIAL SALA <span id="bl-dRv"></span></label><input type="range" id="bl-dR" min="0.2" max="3.0" step="0.1"></div>' +
+    '</div>' +
+    '<div class="field"><label>TEMPERATURA DA SALA (°C · MQTT / MANUAL)</label>' +
+    '<input type="number" id="bl-rt" min="0" max="50" step="0.1" value="20.0"></div>' +
+    '<div class="note err" id="bl-msg"></div></div>';
+  document.body.appendChild(bg);
+  if (boilerState) boilerFill(boilerState); else boilerGet();
+}
+
+function boilerCloseModal() {
+  const m = $("boiler-modal");
+  if (m) m.remove();
+}
+
+function boilerPinSelect(id, label, pinList, current, owner, allowNone) {
+  let opts = allowNone ? '<option value="-1"' + (current < 0 || current === 255 ? " selected" : "") + ">Desativado</option>" : "";
+  opts += pinList.map((p) =>
+    '<option value="' + p + '"' + (p === current ? " selected" : "") + ">GPIO" + p +
+    (owner[p] ? " · ocupado (" + esc(owner[p]) + ")" : "") + "</option>").join("");
+  return '<div class="field"><label>' + label + '</label><select id="' + id + '" data-bl-pin="1">' + opts + "</select></div>";
+}
+
+function boilerI2cPinList() {
+  const base = (config.usablePins || []).slice();
+  [32, 33].forEach((p) => { if (base.indexOf(p) < 0) base.push(p); });
+  return base.sort((a, b) => a - b);
+}
+
+function boilerBtnPinList() {
+  return (config.usablePins || []).concat(config.inputOnlyPins || []).sort((a, b) => a - b);
+}
+
+function boilerProbeOptions(selectedRom) {
+  const seen = {};
+  const list = [];
+  if (boilerState && Array.isArray(boilerState.probes)) {
+    boilerState.probes.forEach((p) => {
+      if (!p.rom || seen[p.rom]) return;
+      seen[p.rom] = true;
+      const t = p.temp != null ? Number(p.temp).toFixed(1) + " °C" : "erro";
+      list.push({ rom: p.rom, label: p.rom + " (" + t + ")" });
+    });
+  }
+  if (selectedRom && !seen[selectedRom]) {
+    list.push({ rom: selectedRom, label: selectedRom + " (guardada)" });
+  }
+  let html = '<option value="">Automático (primeira disponível)</option>';
+  html += list.map((x) =>
+    '<option value="' + esc(x.rom) + '"' + (x.rom === selectedRom ? " selected" : "") + ">" + esc(x.label) + "</option>").join("");
+  return html;
+}
+
+function boilerUpdateProbeSelects() {
+  const w = $("bl-hw-romW"), r = $("bl-hw-romR"), info = $("bl-probes-info");
+  if (!w && !r && !info) return;
+  const curW = w ? w.value : ((config.boiler && config.boiler.romW) || "");
+  const curR = r ? r.value : ((config.boiler && config.boiler.romR) || "");
+  if (w) w.innerHTML = boilerProbeOptions(curW);
+  if (r) r.innerHTML = boilerProbeOptions(curR);
+  if (info && boilerState && Array.isArray(boilerState.probes)) {
+    info.textContent = boilerState.probes.length
+      ? boilerState.probes.length + " sonda(s) detetada(s): " + boilerState.probes.map((p) => p.rom + " (" + (p.temp != null ? Number(p.temp).toFixed(1) + "°C" : "NaN") + ")").join(" · ")
+      : "Nenhuma sonda DS18B20 detetada ainda no pino 1-Wire.";
+  }
+}
+
+function boilerCheckPinForm() {
+  const warn = $("bl-hw-warn");
+  if (!warn || !config.boiler) return;
+  const fields = [
+    ["bl-hw-sda", "SDA LCD"], ["bl-hw-scl", "SCL LCD"], ["bl-hw-dallas", "1-Wire DS18B20"],
+    ["bl-hw-pump", "Bomba"], ["bl-hw-heater", "Resistência"],
+    ["bl-hw-btnMenu", "Botão Menu"], ["bl-hw-btnPlus", "Botão +"],
+    ["bl-hw-btnMinus", "Botão -"], ["bl-hw-btnPower", "Botão ON/OFF"],
+  ];
+  const owner = pinOwners("__boiler__");
+  const seen = {};
+  const msgs = [];
+  fields.forEach(([id, lbl], idx) => {
+    const el = $(id);
+    if (!el) return;
+    const v = parseInt(el.value, 10);
+    if (isNaN(v) || v < 0 || v === 255) return;
+    if (seen[v]) msgs.push("GPIO" + v + " repetido em " + seen[v] + " e " + lbl);
+    seen[v] = lbl;
+    if (owner[v] && !(idx < 2 && (v === 32 || v === 33))) {
+      msgs.push("GPIO" + v + " (" + lbl + ") ocupado por " + owner[v]);
+    }
+  });
+  warn.className = "note" + (msgs.length ? " err" : " hide");
+  warn.textContent = msgs.join(" · ");
+}
+
+function boilerCard(idxNum) {
+  const b = config.boiler;
+  if (!b) return "";
+  const owner = pinOwners("__boiler__");
+  const i2cPins = boilerI2cPinList();
+  const outPins = (config.usablePins || []).slice().sort((a, b2) => a - b2);
+  const btnPins = boilerBtnPinList();
+  return '<div class="card feature-card" id="fc-boiler">' +
+    '<div class="feature-card-head"><span class="feature-index">FUNÇÃO ' + idxNum + '</span>' +
+    '<div class="feature-badges"><span class="feature-badge kind-actuator">TERMOSTATO</span>' +
+    '<span class="feature-badge kind-driver">Aquecimento Central</span></div></div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>NOME</label><input id="bl-hw-name" maxlength="23" value="' + esc(b.name || "Caldeira") + '"></div>' +
+      '<div class="field"><label>ENDEREÇO I2C LCD 20×4</label><select id="bl-hw-addr">' +
+        '<option value="39"' + ((b.lcdAddr || 39) === 39 ? " selected" : "") + '>0x27 (PCF8574 padrão)</option>' +
+        '<option value="63"' + (b.lcdAddr === 63 ? " selected" : "") + '>0x3F (PCF8574A)</option>' +
+      '</select></div>' +
+    '</div>' +
+    '<div class="row2">' +
+      boilerPinSelect("bl-hw-sda", "LCD SDA (I2C)", i2cPins, b.sda, owner, false) +
+      boilerPinSelect("bl-hw-scl", "LCD SCL (I2C)", i2cPins, b.scl, owner, false) +
+    '</div>' +
+    '<div class="row2" style="grid-template-columns:1fr 1fr 1fr;gap:8px">' +
+      boilerPinSelect("bl-hw-dallas", "SONDAS DS18B20 (1-WIRE)", outPins, b.dallas, owner, false) +
+      boilerPinSelect("bl-hw-pump", "RELÉ BOMBA", outPins, b.pump, owner, false) +
+      boilerPinSelect("bl-hw-heater", "RELÉ RESISTÊNCIA", outPins, b.heater, owner, false) +
+    '</div>' +
+    '<div class="row2">' +
+      boilerPinSelect("bl-hw-btnMenu", "BOTÃO MENU", btnPins, b.btnMenu, owner, true) +
+      boilerPinSelect("bl-hw-btnPlus", "BOTÃO MAIS (+)", btnPins, b.btnPlus, owner, true) +
+    '</div>' +
+    '<div class="row2">' +
+      boilerPinSelect("bl-hw-btnMinus", "BOTÃO MENOS (-)", btnPins, b.btnMinus, owner, true) +
+      boilerPinSelect("bl-hw-btnPower", "BOTÃO ON/OFF", btnPins, b.btnPower, owner, true) +
+    '</div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>POTÊNCIA RESISTÊNCIA (W)</label><input type="number" id="bl-hw-hw" min="0" max="30000" value="' + (b.heaterWatts ?? 6500) + '"></div>' +
+      '<div class="field"><label>POTÊNCIA BOMBA (W)</label><input type="number" id="bl-hw-pw" min="0" max="5000" value="' + (b.pumpWatts ?? 70) + '"></div>' +
+    '</div>' +
+    '<div class="field"><label>SONDAS 18B20 NO BARRAMENTO (ENDEREÇO ROM)</label>' +
+      '<div class="row2">' +
+        '<div class="field"><label>SONDA ÁGUA (CALDEIRA)</label><select id="bl-hw-romW">' + boilerProbeOptions(b.romW || "") + '</select></div>' +
+        '<div class="field"><label>SONDA RETORNO</label><select id="bl-hw-romR">' + boilerProbeOptions(b.romR || "") + '</select></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+        '<button type="button" class="btn" data-boiler-scan="1">Detetar sondas DS18B20</button>' +
+        '<span class="note" id="bl-probes-info" style="margin:0"></span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="note hide" id="bl-hw-warn"></div>' +
+    '<div class="feature-card-actions" style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button type="button" class="btn p" data-boiler-savehw="1">Aplicar pinos e sondas</button>' +
+      '<button type="button" class="btn d" data-boiler-del="1">Remover função</button>' +
+    '</div></div>';
+}
+
+document.addEventListener("click", (ev) => {
+  if (ev.target.closest("[data-boiler-cog]")) { boilerOpenModal(); return; }
+  if (ev.target.closest("[data-boiler-close]") || ev.target.id === "boiler-modal") { boilerCloseModal(); return; }
+  if (ev.target.closest("[data-boiler-toggle]")) { boilerSend({ state: boilerOn ? "OFF" : "ON" }, true); return; }
+  const brst = ev.target.closest("[data-boiler-reset]");
+  if (brst) {
+    if (!armed(brst, "Zerar contadores?")) return;
+    boilerSend({ resetEnergy: true }, true);
+    return;
+  }
+  const bscan = ev.target.closest("[data-boiler-scan]");
+  if (bscan) {
+    if ($("bl-probes-info")) $("bl-probes-info").textContent = "A ler barramento 1-Wire...";
+    api("/boiler/scan", { method: "POST" })
+      .then(() => setTimeout(() => api("/boilerstate").then((s) => { boilerShow(s, true, true); toast("Leitura 1-Wire concluída", "ok"); }).catch(() => {}), 1100))
+      .catch(() => toast("Não foi possível ler o barramento 1-Wire", "err"));
+    return;
+  }
+  const bsave = ev.target.closest("[data-boiler-savehw]");
+  if (bsave) {
+    const body = {
+      name: ($("bl-hw-name").value || "Caldeira").trim(),
+      lcdAddr: parseInt($("bl-hw-addr").value, 10) || 39,
+      sda: parseInt($("bl-hw-sda").value, 10),
+      scl: parseInt($("bl-hw-scl").value, 10),
+      dallas: parseInt($("bl-hw-dallas").value, 10),
+      pump: parseInt($("bl-hw-pump").value, 10),
+      heater: parseInt($("bl-hw-heater").value, 10),
+      btnMenu: parseInt($("bl-hw-btnMenu").value, 10),
+      btnPlus: parseInt($("bl-hw-btnPlus").value, 10),
+      btnMinus: parseInt($("bl-hw-btnMinus").value, 10),
+      btnPower: parseInt($("bl-hw-btnPower").value, 10),
+      heaterWatts: parseInt($("bl-hw-hw").value, 10) || 6500,
+      pumpWatts: parseInt($("bl-hw-pw").value, 10) || 70,
+      romW: $("bl-hw-romW").value || "",
+      romR: $("bl-hw-romR").value || "",
+    };
+    api("/boiler/pins", { method: "POST", body: JSON.stringify(body) })
+      .then((c) => {
+        config = c;
+        renderOverview(); renderPinout(); renderFeatures(); fillNewFeatureForm(); wireFeatureEvents();
+        boilerGet();
+        toast("Pinos e sondas da caldeira aplicados", "ok");
+      })
+      .catch((e) => toast(featureError(e), "err"));
+    return;
+  }
+  const bdel = ev.target.closest("[data-boiler-del]");
+  if (bdel) {
+    if (!armed(bdel, "Confirmar?")) return;
+    api("/boiler/remove", { method: "POST" })
+      .then(() => api("/config"))
+      .then((c) => {
+        config = c;
+        boilerCloseModal();
+        renderOverview(); renderPinout(); renderFeatures(); fillNewFeatureForm(); wireFeatureEvents();
+        toast("Aquecimento central removido", "ok");
+      })
+      .catch(() => toast("Não foi possível remover a caldeira", "err"));
+  }
+});
+
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") boilerCloseModal(); });
+
+document.addEventListener("input", (ev) => {
+  const id = ev.target.id;
+  if (id === "bl-spH") { $("bl-spHv").textContent = ev.target.value + " °C"; boilerSend({ spHeater: +ev.target.value }); }
+  else if (id === "bl-dH") { $("bl-dHv").textContent = ev.target.value + " °C"; boilerSend({ diffHeater: +ev.target.value }); }
+  else if (id === "bl-spP") { $("bl-spPv").textContent = ev.target.value + " °C"; boilerSend({ spPump: +ev.target.value }); }
+  else if (id === "bl-dP") { $("bl-dPv").textContent = ev.target.value + " °C"; boilerSend({ diffPump: +ev.target.value }); }
+  else if (id === "bl-spR") { $("bl-spRv").textContent = Number(ev.target.value).toFixed(1) + " °C"; boilerSend({ spRoom: +ev.target.value }); }
+  else if (id === "bl-dR") { $("bl-dRv").textContent = Number(ev.target.value).toFixed(1) + " °C"; boilerSend({ diffRoom: +ev.target.value }); }
+});
+
+document.addEventListener("change", (ev) => {
+  if (ev.target.id === "bl-rt") { boilerSend({ roomTemp: +ev.target.value }, true); return; }
+  if (ev.target.dataset && ev.target.dataset.blPin) { boilerCheckPinForm(); }
+});
+
+setInterval(() => {
+  if (typeof config !== "undefined" && config && config.boiler && !document.hidden &&
+      Date.now() - boilerBusy > 1500) boilerGet();
+}, 3000);
+/* ---------------- Ligação ESP-NOW para SHT4x Auto-Detetado -> Aquecimento Central ---------------- */
+var thermostatState = null;
+var thermostatBusy = 0;
+var thermostatTimer = null;
+
+function isThermostatMode() {
+  return typeof config !== "undefined" && config && Number(config.templateId) === 10 &&
+    (config.features || []).some((f) => f.driver === "SHT4X");
+}
+
+function thBadgeHtml(s) {
+  if (!isThermostatMode()) return "";
+  const status = !s
+    ? "ESP-NOW a aguardar estado..."
+    : (s.boilerOnline
+        ? ("ESP-NOW Caldeira OK (" + (s.lastBoilerMac || s.targetMac) + ") · Bomba " +
+            (s.boilerPump ? "ON" : "OFF") + " · Água " + (s.boilerWaterTemp != null ? Number(s.boilerWaterTemp).toFixed(1) + "°C" : "--"))
+        : (s.lastTxAgoSec >= 0 ? "ESP-NOW TX há " + s.lastTxAgoSec + "s · à espera da Caldeira" : "ESP-NOW ativo · Caldeira"));
+  return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid rgba(128,128,128,.2)">' +
+    '<span class="note" id="th-card-link" style="margin:0;font-size:11px">' + esc(status) + '</span>' +
+    '<button type="button" class="btn" data-th-open="1" style="padding:5px 10px;font-size:11px">ESP-NOW Caldeira</button></div>';
+}
+
+function thermostatSync() {
+  if (!isThermostatMode()) { thermostatCloseModal(); thermostatState = null; return; }
+  if (!thermostatState) thermostatGet();
+}
+
+function thermostatFill(s) {
+  if (!s) return;
+  const linkCard = $("th-card-link");
+  if (linkCard) {
+    linkCard.textContent = s.boilerOnline
+      ? ("ESP-NOW Caldeira OK (" + (s.lastBoilerMac || s.targetMac) + ") · Bomba " +
+          (s.boilerPump ? "ON" : "OFF") + " · Água " + (s.boilerWaterTemp != null ? Number(s.boilerWaterTemp).toFixed(1) + "°C" : "--"))
+      : (s.lastTxAgoSec >= 0 ? "ESP-NOW TX há " + s.lastTxAgoSec + "s · à espera da Caldeira" : "ESP-NOW ativo · Caldeira");
+  }
+  if (!$("th-modal")) return;
+  if ($("th-temp")) $("th-temp").textContent = s.temperature != null ? Number(s.temperature).toFixed(1) + " °C" : "Erro SHT4x";
+  if ($("th-hum")) $("th-hum").textContent = s.humidity != null ? Number(s.humidity).toFixed(1) + " %" : "—";
+  if ($("th-mac")) $("th-mac").textContent = (s.ownMac || "—") + " · Canal " + (s.wifiChannel || 0);
+  if ($("th-link")) {
+    $("th-link").textContent = s.boilerOnline
+      ? "Ligado à Caldeira (" + (s.lastBoilerMac || s.targetMac) + ") · ACK há " + s.lastAckAgoSec + "s · " +
+        (s.boilerOn ? ("Caldeira ON · Bomba " + (s.boilerPump ? "ON" : "OFF") + " · Res " + (s.boilerHeater ? "ON" : "OFF")) : "Caldeira STANDBY")
+      : (s.lastTxAgoSec >= 0 ? "Enviado há " + s.lastTxAgoSec + "s (" + s.txCount + " pct) · à espera de ACK da Caldeira" : "A aguardar envio ESP-NOW");
+  }
+  const macEl = $("th-tmac");
+  if (macEl && document.activeElement !== macEl) macEl.value = s.targetMac || "FF:FF:FF:FF:FF:FF";
+  const chEl = $("th-ch");
+  if (chEl && document.activeElement !== chEl) chEl.value = s.channel || 0;
+  const ivEl = $("th-iv");
+  if (ivEl && document.activeElement !== ivEl) ivEl.value = s.sendIntervalSec ?? 10;
+  const offEl = $("th-off");
+  if (offEl && document.activeElement !== offEl) offEl.value = Number(s.tempOffset ?? 0).toFixed(1);
+  const spEl = $("th-sp"), spLbl = $("th-spv");
+  if (spEl && document.activeElement !== spEl) spEl.value = s.spRoom ?? 21;
+  if (spLbl) spLbl.textContent = Number(s.spRoom ?? 21).toFixed(1) + " °C";
+  if ($("th-syncsp")) $("th-syncsp").checked = !!s.syncSetpoint;
+  const lockBtn = $("th-lockmac");
+  if (lockBtn) {
+    const canLock = s.lastBoilerMac && s.broadcast;
+    lockBtn.classList.toggle("hide", !canLock);
+    if (canLock) lockBtn.dataset.mac = s.lastBoilerMac;
+  }
+}
+
+async function thermostatGet() {
+  const reqAt = Date.now();
+  try {
+    const s = await api("/thermostatstate");
+    if (thermostatBusy > reqAt) return;
+    thermostatState = s;
+    thermostatFill(s);
+  } catch (e) {
+    if ($("th-msg")) $("th-msg").textContent = "Sem resposta do serviço ESP-NOW.";
+  }
+}
+
+function thermostatSend(o, now) {
+  clearTimeout(thermostatTimer);
+  thermostatBusy = Date.now();
+  const go = async () => {
+    thermostatBusy = Date.now();
+    try {
+      const s = await api("/thermostat/set", { method: "POST", body: JSON.stringify(o) });
+      thermostatState = s;
+      thermostatFill(s);
+    } catch (e) {
+      if ($("th-msg")) $("th-msg").textContent = "Não foi possível atualizar a ligação ESP-NOW.";
+    } finally {
+      setTimeout(() => { thermostatBusy = 0; }, 400);
+    }
+  };
+  if (now) go(); else thermostatTimer = setTimeout(go, 120);
+}
+
+function thermostatOpenModal() {
+  if ($("th-modal")) return;
+  const bg = document.createElement("div");
+  bg.className = "modal-bg";
+  bg.id = "th-modal";
+  bg.innerHTML =
+    '<div class="modal" role="dialog" aria-modal="true" aria-label="ESP-NOW Termostato">' +
+    '<div class="modal-head"><b>SHT4x ⇄ Aquecimento Central (ESP-NOW)</b>' +
+    '<button type="button" class="modal-x" data-th-close="1" aria-label="Fechar">×</button></div>' +
+    '<div class="row2" style="margin-bottom:10px">' +
+      '<div class="card" style="padding:12px"><div class="sub" style="margin:0 0 4px">TEMPERATURA SALA (SHT4x)</div><b style="font-size:22px" id="th-temp">—</b></div>' +
+      '<div class="card" style="padding:12px"><div class="sub" style="margin:0 0 4px">HUMIDADE RELATIVA</div><b style="font-size:22px" id="th-hum">—</b></div>' +
+    '</div>' +
+    '<div class="card" style="padding:10px 12px;margin-bottom:10px">' +
+      '<div class="sub" style="margin:0 0 2px">MAC DESTE ESP32 & CANAL WI-FI</div>' +
+      '<div style="font:600 12px/1.4 ui-monospace,monospace" id="th-mac">—</div>' +
+      '<div class="sub" style="margin:8px 0 2px">ESTADO DA LIGAÇÃO COM A CALDEIRA</div>' +
+      '<div class="note" id="th-link" style="margin:0">—</div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">' +
+        '<button type="button" class="btn p" data-th-sendnow="1">Enviar Temperatura Agora</button>' +
+        '<button type="button" class="btn hide" id="th-lockmac" data-th-lockmac="1">Fixar MAC da Caldeira (Unicast)</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>MAC DA CALDEIRA</label><input id="th-tmac" maxlength="17" value="FF:FF:FF:FF:FF:FF" placeholder="FF:FF:FF:FF:FF:FF"></div>' +
+      '<div class="field"><label>CANAL WI-FI ESP-NOW</label><select id="th-ch">' +
+        '<option value="0">Automático (canal Wi-Fi)</option>' +
+        [1,2,3,4,5,6,7,8,9,10,11,12,13].map((c) => '<option value="' + c + '">Canal ' + c + '</option>').join("") +
+      '</select></div>' +
+    '</div>' +
+    '<div class="row2">' +
+      '<div class="field"><label>INTERVALO DE ENVIO (s)</label><input type="number" id="th-iv" min="2" max="300" value="10"></div>' +
+      '<div class="field"><label>OFFSET CALIBRAÇÃO (°C)</label><input type="number" id="th-off" min="-5" max="5" step="0.1" value="0.0"></div>' +
+    '</div>' +
+    '<div class="field"><label>SETPOINT SALA <span id="th-spv">21.0 °C</span></label>' +
+    '<input type="range" id="th-sp" min="16" max="30" step="0.5" value="21.0"></div>' +
+    '<label class="f-check" style="margin-bottom:8px"><input type="checkbox" id="th-syncsp"> Enviar também este Setpoint Sala para a Caldeira via ESP-NOW</label>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">' +
+      '<button type="button" class="btn p" data-th-save="1">Guardar Ligação ESP-NOW</button>' +
+    '</div>' +
+    '<div class="note err" id="th-msg"></div></div>';
+  document.body.appendChild(bg);
+  if (thermostatState) thermostatFill(thermostatState); else thermostatGet();
+}
+
+function thermostatCloseModal() {
+  const m = $("th-modal");
+  if (m) m.remove();
+}
+
+document.addEventListener("click", (ev) => {
+  if (ev.target.closest("[data-th-open]")) { thermostatOpenModal(); return; }
+  if (ev.target.closest("[data-th-close]") || ev.target.id === "th-modal") { thermostatCloseModal(); return; }
+  if (ev.target.closest("[data-th-sendnow]")) {
+    api("/thermostat/send", { method: "POST" })
+      .then((s) => { thermostatState = s; thermostatFill(s); toast("Temperatura enviada para a Caldeira via ESP-NOW", "ok"); })
+      .catch(() => toast("Não foi possível enviar via ESP-NOW", "err"));
+    return;
+  }
+  const lockBtn = ev.target.closest("[data-th-lockmac]");
+  if (lockBtn && lockBtn.dataset.mac) {
+    thermostatSend({ targetMac: lockBtn.dataset.mac }, true);
+    toast("MAC da Caldeira fixado (" + lockBtn.dataset.mac + ")", "ok");
+    return;
+  }
+  if (ev.target.closest("[data-th-save]")) {
+    thermostatSend({
+      targetMac: ($("th-tmac").value || "FF:FF:FF:FF:FF:FF").trim(),
+      channel: parseInt($("th-ch").value, 10) || 0,
+      sendIntervalSec: parseInt($("th-iv").value, 10) || 10,
+      tempOffset: parseFloat($("th-off").value) || 0,
+      syncSetpoint: $("th-syncsp").checked,
+      spRoom: parseFloat($("th-sp").value) || 21,
+    }, true);
+    toast("Ligação ESP-NOW guardada", "ok");
+  }
+});
+
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") thermostatCloseModal(); });
+
+document.addEventListener("input", (ev) => {
+  if (ev.target.id === "th-sp") {
+    if ($("th-spv")) $("th-spv").textContent = Number(ev.target.value).toFixed(1) + " °C";
+    thermostatSend({ spRoom: +ev.target.value });
+  }
+});
+
+document.addEventListener("change", (ev) => {
+  if (ev.target.id === "th-syncsp") { thermostatSend({ syncSetpoint: ev.target.checked }, true); }
+});
+
+setInterval(() => {
+  if (typeof config !== "undefined" && config && isThermostatMode() && !document.hidden &&
+      Date.now() - thermostatBusy > 1500) thermostatGet();
+}, 3000);
 const ENERGY_DRIVERS = ["HAN_MODBUS", "HAN_MODBUS_8N2", "PZEM_004T_V03", "PZEM_004T_V01"];
 const isEnergy = (f) => ENERGY_DRIVERS.indexOf(f.driver) >= 0;
 
@@ -1732,7 +2413,8 @@ function sensorText(state, driver) {
   if (o.humidity != null) bits.push(Math.round(o.humidity) + "%");
   if (o.power != null) bits.push(Math.round(o.power) + "W");
   if (o.distance != null) bits.push(Math.round(o.distance) + " cm");
-  if (o.illuminance != null) bits.push(Math.round(o.illuminance) + " lx");
+  const luxVal = o.illuminance != null ? o.illuminance : o.lux;
+  if (luxVal != null && isFinite(Number(luxVal))) bits.push((Math.round(Number(luxVal) * 100) / 100) + " lx");
   if (o.liters != null) {
     // Cubic metres are how a water bill and the meter's own dial read; litres are
     // what the last three digits say. Show both rather than making anyone divide.
@@ -1839,7 +2521,8 @@ function climateCard(f, shouldRecord) {
     '<div class="climate-values" id="sv-' + esc(f.id) + '">' + (temperature || humidity || "—") + '</div>' +
     collecting + temperatureGraph + humidityGraph +
     '<div class="climate-caption">' + scope + (samples.length ? " · " + samples.length +
-      (samples.length === 1 ? " leitura" : " leituras") : "") + "</div></div>";
+      (samples.length === 1 ? " leitura" : " leituras") : "") + "</div>" +
+    (f.driver === "SHT4X" && typeof thBadgeHtml === "function" ? thBadgeHtml(thermostatState) : "") + "</div>";
 }
 
 function renderPinout() {
@@ -1849,6 +2532,17 @@ function renderPinout() {
   for (const f of config.features || []) {
     for (const o of f.outputs || []) used[o] = { n: f.name, k: "out" };
     for (const i of f.inputs || []) used[i] = { n: f.name, k: "in" };
+  }
+  if (config.ledStrip && config.ledStrip.pin != null) used[config.ledStrip.pin] = { n: config.ledStrip.name, k: "out" };
+  if (config.boiler) {
+    const b = config.boiler, bn = b.name || "Caldeira";
+    if (b.pump >= 0) used[b.pump] = { n: bn + " (Bomba)", k: "out" };
+    if (b.heater >= 0) used[b.heater] = { n: bn + " (Resistência)", k: "out" };
+    if (b.dallas >= 0) used[b.dallas] = { n: bn + " (DS18B20)", k: "in" };
+    if (b.btnMenu >= 0) used[b.btnMenu] = { n: bn + " (Menu)", k: "in" };
+    if (b.btnPlus >= 0) used[b.btnPlus] = { n: bn + " (+)", k: "in" };
+    if (b.btnMinus >= 0) used[b.btnMinus] = { n: bn + " (-)", k: "in" };
+    if (b.btnPower >= 0) used[b.btnPower] = { n: bn + " (ON/OFF)", k: "in" };
   }
   const all = usable.concat(inputOnly).sort((a, b) => a - b);
   const half = Math.ceil(all.length / 2);
@@ -1873,19 +2567,34 @@ function renderPinout() {
 /* Which feature drives a given pin, ignoring the one being edited. Every pin
    stays on the menu — an occupied one is named, not hidden, so it is obvious
    what has to be freed first. */
-function pinOwners(selfId) {
+const I2C_SHARED_DRIVERS = ["SHT4X", "LTR303", "TMF882X", "LDC1612"];
+const isI2cShared = (f) => !!(f && I2C_SHARED_DRIVERS.indexOf(String(f.driver || "")) >= 0);
+function pinOwners(selfId, selfIsI2c) {
   const owner = {};
   for (const o of config.features || []) {
     if (o.id === selfId) continue;
+    if (selfIsI2c && isI2cShared(o)) continue;
     for (const p of o.outputs || []) owner[p] = o.name;
     for (const p of o.inputs || []) owner[p] = o.name;
   }
   if (config.ledStrip && config.ledStrip.pin != null) owner[config.ledStrip.pin] = config.ledStrip.name;
+  if (config.boiler && selfId !== "__boiler__") {
+    const b = config.boiler, bn = b.name || "Caldeira";
+    [b.dallas, b.pump, b.heater, b.btnMenu, b.btnPlus, b.btnMinus, b.btnPower].forEach((p) => { if (p >= 0 && p !== 255) owner[p] = bn; });
+    if (b.sda >= 0 && b.sda !== 32) owner[b.sda] = bn;
+    if (b.scl >= 0 && b.scl !== 33) owner[b.scl] = bn;
+  }
   return owner;
 }
 
 function pinSelect(f, fi, kind, slot, current, owner) {
-  const opts = (config.usablePins || []).map((p) =>
+  const pins = (config.usablePins || []).slice();
+  if (current != null && current >= 0 && pins.indexOf(current) < 0) pins.push(current);
+  if (isI2cShared(f)) {
+    (f.inputs || []).forEach((p) => { if (p != null && p >= 0 && pins.indexOf(p) < 0) pins.push(p); });
+  }
+  pins.sort((a, b) => a - b);
+  const opts = pins.map((p) =>
     '<option value="' + p + '"' + (p === current ? " selected" : "") + ">GPIO" + p +
     (owner[p] ? " · ocupado (" + esc(owner[p]) + ")" : "") + "</option>").join("");
   return '<select data-pin="' + kind + '" data-i="' + fi + '" data-k="' + slot + '">' + opts + "</select>";
@@ -1897,7 +2606,7 @@ function pinEditor(f, i) {
   const outs = f.outputs || [];
   const ins = f.inputs || [];
   if (!outs.length && !ins.length) return "";
-  const owner = pinOwners(f.id);
+  const owner = pinOwners(f.id, isI2cShared(f));
   const block = (label, kind, pins) => !pins.length ? "" :
     '<div class="field"><label>' + label + "</label>" +
     '<div class="row2" style="grid-template-columns:repeat(' + Math.min(pins.length, 3) + ',1fr)">' +
@@ -1948,7 +2657,9 @@ function featureKind(f) {
 function renderFeatures() {
   const feats = config.features || [];
   const led = config.ledStrip || null;
-  const total = feats.length + (led ? 1 : 0);
+  const hasBoiler = !!config.boiler;
+  const total = feats.length + (led ? 1 : 0) + (hasBoiler ? 1 : 0);
+  const bCard = (hasBoiler && typeof boilerCard === "function") ? boilerCard(total - (led ? 1 : 0)) : "";
   $("feat-count").textContent = total + (total === 1 ? " função" : " funções");
   const ledCard = !led ? "" :
     '<div class="card feature-card">' +
@@ -1965,7 +2676,7 @@ function renderFeatures() {
     '<p class="note" style="margin:0 2px 10px">Liga e desliga-se no mosaico da Visão geral; a rodinha desse mosaico abre a cor, o brilho e os efeitos. ' +
     'Para mudar o pino, remove a função e cria-a de novo.</p>' +
     '<div class="feature-card-actions"><button class="btn d" data-led-del="1">Remover função</button></div></div>';
-  $("feat-list").innerHTML = (feats.length || led) ? feats.map((f, i) => {
+  $("feat-list").innerHTML = (feats.length || led || hasBoiler) ? feats.map((f, i) => {
     const cover = isCover(f);
     const kind = featureKind(f);
     const hasState = hasBinaryFunctionState(f);
@@ -2014,7 +2725,7 @@ function renderFeatures() {
         '<input type="number" min="0" max="255" data-f="member" data-i="' + i + '" value="' + (f.member || 0) + '">' +
         "</div></div>" : "") +
       '<div class="feature-card-actions"><button class="btn d" data-del="' + esc(f.id) + '">Remover função</button></div></div>';
-  }).join("") + ledCard : '<div class="note">Ainda não há funções configuradas.</div>';
+  }).join("") + bCard + ledCard : '<div class="note">Ainda não há funções configuradas.</div>';
 }
 
 function renderDiag() {
@@ -2127,7 +2838,7 @@ function openFirmwareSettings() {
 function fillNewFeatureForm() {
   const sel = $("nf-driver");
   // The strip is offered only by firmwares that carry it; the ESP8266 has no memory for it.
-  const drivers = DRIVERS.filter((g) => config.ledSupport === true || !g.items.some((d) => d.v === 200));
+  const drivers = DRIVERS.filter((g) => (config.ledSupport === true || !g.items.some((d) => d.v === 200)) && (config.boilerSupport === true || !g.items.some((d) => d.v === 201)));
   sel.innerHTML = drivers.map((g) => '<optgroup label="' + esc(g.g) + '">' +
     g.items.map((d) => '<option value="' + d.v + '">' + esc(d.n) + "</option>").join("") + "</optgroup>").join("");
   // Every usable pin is listed; an occupied one names its owner instead of
@@ -2209,6 +2920,7 @@ async function addFeature() {
   msg.className = "note"; msg.textContent = "A criar…";
   const body = { name: name, driver: driver, input1: p1 };
   if (p2 !== undefined) body.input2 = p2;
+  if (driver === 201) { body.dallas = p1; body.pump = p2; }
   if (driver === 200) {
     const n = parseInt($("nf-leds").value, 10);
     if (!(n >= 1 && n <= 600)) { msg.className = "note err"; msg.textContent = "O número de LEDs tem de ser entre 1 e 600."; return; }

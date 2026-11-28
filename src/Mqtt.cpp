@@ -10,6 +10,7 @@
 #include "HomeAssistantMqttDiscovery.h"
 #include "WebServer.h"
 #include "LedStrip.h"
+#include "Boiler.h"
 extern ConfigOnofre config;
 static WiFiClient espClient;
 static PubSubClient mqttClient(espClient);
@@ -52,6 +53,10 @@ void callbackMqtt(char *topic, byte *payload, unsigned int length)
     else if (ledStripHandleMqtt(topic, payload_as_string))
     {
         // consumed by the LED strip
+    }
+    else if (boilerHandleMqtt(topic, payload_as_string))
+    {
+        // consumed by the boiler controller
     }
     else
     {
@@ -96,6 +101,7 @@ boolean reconnect()
         // Where the Home Assistant buttons and the zone-count number send to.
         subscribeOnMqtt(config.irrigationWriteTopic);
         ledStripSubscribe();
+        boilerSubscribe();
         initHomeAssistantDiscovery();
     }
 

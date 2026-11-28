@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [9.237] - 2026-11-28
+
+### Added
+
+- Firmware unificado Caldeira (Aquecimento Central) + Termostato Ambiente SHT4x via ESP-NOW, paletes WLED e leitura LTR303 em lux.
+
 ## [9.236] - 2026-11-24
 
 ### Fixed

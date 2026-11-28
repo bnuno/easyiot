@@ -11,6 +11,8 @@
 #include "Irrigation.h"
 #include "DeviceLog.h"
 #include "LedStrip.h"
+#include "Boiler.h"
+#include "RoomThermostat.h"
 #include <LittleFS.h>
 // STATIC WEBPANEL
 #include "CaptivePortal.h"
@@ -661,7 +663,7 @@ void loadWebPanel()
       return;
     AsyncWebServerResponse *response = beginProgmemResponse(request, 200, "application/javascript", index_js, sizeof(index_js));
     response->addHeader("Content-Encoding", "gzip");
-    response->addHeader("Cache-Control", "max-age=600");
+    response->addHeader("Cache-Control", "no-store");
     request->send(response); });
 
   // CSS
@@ -825,6 +827,9 @@ void loadAPI()
     JsonVariant &root = response->getRoot();
     JsonObject featureJson = json.as<JsonObject>();
     int result;
+    if ((featureJson["driver"] | 999) == 201)
+      result = boilerCreate(featureJson);
+    else
 #ifdef LED_STRIP
     if ((featureJson["driver"] | 999) == kLedStripDriverCode)
       result = ledStripCreate(featureJson["name"] | "", featureJson["input1"] | -1, featureJson["leds"] | 60);
@@ -1075,7 +1080,7 @@ void loadAPI()
     templateValue.trim();
     const int templateId = templateValue.toInt();
     if (templateValue != String(templateId) ||
-        templateId < Template::DUAL_LIGHT || templateId > Template::TOF_DISTANCE)
+        templateId < Template::DUAL_LIGHT || templateId > Template::THERMOSTAT)
     {
       request->send(errorResponse("Template id is invalid"));
       return;
@@ -1169,6 +1174,115 @@ void loadAPI()
     response->setLength();
     request->send(response); }));
 #endif
+
+
+  server.on("/boilerstate", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    if (!authorizeRequest(request))
+      return;
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    boilerStateJson(root);
+    response->setLength();
+    request->send(response); });
+
+  server.on("/boiler/scan", HTTP_POST, [](AsyncWebServerRequest *request)
+            {
+    if (!authorizeRequest(request))
+      return;
+    boilerRequestScan();
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    boilerStateJson(root);
+    response->setLength();
+    request->send(response); });
+
+  server.on("/boiler/remove", HTTP_POST, [](AsyncWebServerRequest *request)
+            {
+    if (!authorizeRequest(request))
+      return;
+    boilerRemove();
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    root["removed"] = true;
+    response->setLength();
+    request->send(response); });
+
+  server.addHandler(new AsyncCallbackJsonWebHandler("/boiler/set", [](AsyncWebServerRequest *request, JsonVariant json)
+                                                    {
+    if (!authorizeRequest(request))
+      return;
+    if (!boilerQueueCommand(json))
+    {
+      request->send(errorResponse("Boiler busy or command too large", 409));
+      return;
+    }
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    boilerStateJson(root);
+    response->setLength();
+    request->send(response); }));
+
+  server.addHandler(new AsyncCallbackJsonWebHandler("/boiler/pins", [](AsyncWebServerRequest *request, JsonVariant json)
+                                                    {
+    if (!authorizeRequest(request))
+      return;
+    if (!config.waitBeginFeatureAccess("web", kRequestLeaseWaitMs))
+    {
+      sendFeatureBusy(request);
+      return;
+    }
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    const int err = boilerUpdateHardware(json);
+    if (err == 0)
+    {
+      config.json(root, true);
+    }
+    else
+    {
+      response->setCode(400);
+      root["result"] = err;
+    }
+    config.endFeatureAccess();
+    response->setLength();
+    request->send(response); }));
+
+  server.on("/thermostatstate", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    if (!authorizeRequest(request))
+      return;
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    thermostatStateJson(root);
+    response->setLength();
+    request->send(response); });
+
+  server.on("/thermostat/send", HTTP_POST, [](AsyncWebServerRequest *request)
+            {
+    if (!authorizeRequest(request))
+      return;
+    thermostatRequestSend();
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    thermostatStateJson(root);
+    response->setLength();
+    request->send(response); });
+
+  server.addHandler(new AsyncCallbackJsonWebHandler("/thermostat/set", [](AsyncWebServerRequest *request, JsonVariant json)
+                                                    {
+    if (!authorizeRequest(request))
+      return;
+    if (!thermostatQueueCommand(json))
+    {
+      request->send(errorResponse("Thermostat busy or command too large", 409));
+      return;
+    }
+    AsyncJsonResponse *response = new AsyncJsonResponse();
+    JsonVariant &root = response->getRoot();
+    thermostatStateJson(root);
+    response->setLength();
+    request->send(response); }));
 
   server.on("/reboot", HTTP_POST, rebootHandler);
   server.on("/reboot", HTTP_GET, rebootHandler);

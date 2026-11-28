@@ -1526,7 +1526,7 @@ ConfigUpdateResult ConfigOnofre::stageRestore(JsonObject &root)
   JsonVariantConst dhcpValue = submitted["dhcp"];
   JsonVariantConst featuresValue = submitted["features"];
   if (!templateValue.is<unsigned int>() ||
-      templateValue.as<unsigned int>() > static_cast<unsigned int>(Template::WATER_METER) ||
+      templateValue.as<unsigned int>() > static_cast<unsigned int>(Template::THERMOSTAT) ||
       !mqttPortValue.is<unsigned int>() || mqttPortValue.as<unsigned int>() == 0 ||
       mqttPortValue.as<unsigned int>() > 65535u || !dhcpValue.is<bool>() ||
       !featuresValue.is<JsonArrayConst>() ||
@@ -2221,6 +2221,7 @@ ConfigUpdateResult ConfigOnofre::update(JsonObject &root, JsonVariant &responseR
 
 void ConfigOnofre::json(JsonVariant &root, bool allFields)
 {
+  root["templateId"] = templateId;
   root["nodeId"] = nodeId;
   root["chipId"] = chipId;
   root["mqttIpDns"] = mqttIpDns;
@@ -2272,6 +2273,8 @@ void ConfigOnofre::json(JsonVariant &root, bool allFields)
       usable.add(pin);
     ledStripConfigJson(root); // the LED strip feature, when one exists
     root["ledSupport"] = ledStripSupported(); // the panel offers the strip only when the firmware carries it
+    boilerConfigJson(root);
+    root["boilerSupport"] = true;
 #ifdef ESP32
     JsonArray inputOnly = root["inputOnlyPins"].to<JsonArray>();
 #if !defined(ESP32C6) && !defined(ESP32C3)

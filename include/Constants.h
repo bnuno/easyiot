@@ -11,6 +11,8 @@ enum Template
     GARDEN,
     WATER_METER,
     TOF_DISTANCE,
+    BOILER,
+    THERMOSTAT,
 };
 namespace constantsMqtt
 {
@@ -361,3 +363,7 @@ namespace FeatureDrivers
 
     constexpr const char *INVALID{"INVALID"};
 }
+
+#ifndef VERSION
+#define VERSION "9.237"
+#endif

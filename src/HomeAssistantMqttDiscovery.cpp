@@ -3,6 +3,7 @@
 #include "ConfigOnofre.h"
 #include "Irrigation.h"
 #include "LedStrip.h"
+#include "Boiler.h"
 extern ConfigOnofre config;
 
 bool homeAssistantOnline(String topic, String payload)
@@ -678,6 +679,7 @@ void initHomeAssistantDiscovery()
   createHaIrrigation();
   publishIrrigationHomeAssistantState();
   ledStripDiscovery();
+  boilerDiscovery();
 }
 
 namespace

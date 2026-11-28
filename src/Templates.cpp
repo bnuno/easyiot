@@ -4,6 +4,7 @@
 #include "Sensors.h"
 #include "ConfigOnofre.h"
 #include "Irrigation.h"
+#include "Boiler.h"
 #include <algorithm>
 extern ConfigOnofre config;
 
@@ -41,6 +42,8 @@ bool setActuatorName(Actuator &actuator, const String &name)
 
 void clearLiveFeatureGraphSafely()
 {
+    if (boilerIsCreated())
+        boilerRemove();
     // init() selects its first template with an empty graph. Do not touch GPIOs
     // in that path; teardown is only for replacing already-live features.
     if (config.actuatores.empty() && config.sensors.empty())
@@ -68,6 +71,7 @@ void clearLiveFeatureGraphSafely()
     }
     for (auto &sensor : config.sensors)
         sensor.deactivateForConfigUpdate();
+    boilerRemove();
 }
 } // namespace
 
@@ -453,7 +457,7 @@ bool templateSelect(enum Template _template)
 {
     if (config.templateId != Template::NO_TEMPLATE)
         return false;
-    if (_template < Template::NO_TEMPLATE || _template > Template::TOF_DISTANCE)
+    if (_template < Template::NO_TEMPLATE || _template > Template::THERMOSTAT)
         return false;
 #ifdef DEBUG_ONOFRE
     Log.info("%s Template selected: %d" CR, tags::webserver, _template);
@@ -519,6 +523,12 @@ bool templateSelect(enum Template _template)
         prepareActuator(I18N::VALVE_FOUR, DefaultPins::OUTPUT_VALVE_FOUR, DefaultPins::noGPIO, ActuatorDriver::GARDEN_VALVE, ActuatorControlType::GPIO_OUTPUT);
 #endif
 #endif
+        break;
+    case Template::BOILER:
+        boilerCreateDefault();
+        break;
+    case Template::THERMOSTAT:
+        prepareSHT4X(Discovery::I2C_SHT4X_ADDRESS);
         break;
     default:
         return false;

@@ -7,6 +7,8 @@
 #include "Mqtt.h"
 #include "Persistence.h"
 #include "LedStrip.h"
+#include "Boiler.h"
+#include "RoomThermostat.h"
 #include <esp-knx-ip.h>
 #include "LittleFS.h"
 #ifdef ESP32
@@ -345,6 +347,8 @@ void setup()
 #endif
   setupMQTT(false);
   ledStripSetup();
+  boilerSetup();
+  thermostatSetup();
 #ifdef ESP32
 // Priority 100 is above configMAX_PRIORITIES, so FreeRTOS clamped it to the top of
 // the range — putting sensor polling above the WiFi and TCP/IP tasks, which then
@@ -375,6 +379,8 @@ void loop()
     loopMqtt();
     config.loopActuators();
     ledStripLoop();
+    boilerLoop();
+    thermostatLoop();
 #ifdef ESP8266
     config.loopSensors();
     config.serviceDeferredI2cDiscovery();
